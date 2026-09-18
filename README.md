@@ -49,6 +49,12 @@ Linux：
 
 Runtime host 代码不需要 CUDA Toolkit 头文件；它在运行时 dlopen("libcuda.so.1")。
 
+不需要模型文件，先单独验证 3090 的 Driver API + VMM + PTX 整条底层链路：
+
+    ./build/q38-gpu-smoke
+
+成功时应看到 `smoke: PASS (Driver API + VMM + PTX kernel)`。这会验证 sm_86、GPU VA 预留、物理显存映射、访问权限、PTX JIT、kernel launch 和 H2D/D2H 数据一致性。
+
 无 GPU 先检查 pack：
 
     ./build/q38-runtime --model /models/Qwen3.8-27B-Q4_K_M.q38pack --no-gpu
