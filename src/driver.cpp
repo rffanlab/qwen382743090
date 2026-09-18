@@ -200,7 +200,7 @@ private:
 };
 
 constexpr const char* kSmokePtx = R"ptx(
-.version 7.0
+.version 7.1
 .target sm_86
 .address_size 64
 
@@ -329,7 +329,7 @@ bool NvidiaDriver::run_sm86_smoke(std::string* error) {
         ScopedVmm memory(handle_, device_ordinal_, 4096);
         using MemcpyHtoD = CUresult(*)(CUdeviceptr, const void*, std::size_t);
         using MemcpyDtoH = CUresult(*)(void*, CUdeviceptr, std::size_t);
-        using ModuleLoadData = CUresult(*)(CUmodule*, const void*);
+        using ModuleLoadDataEx = CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
         using ModuleUnload = CUresult(*)(CUmodule);
         using ModuleGetFunction = CUresult(*)(CUfunction*, CUmodule, const char*);
         using LaunchKernel = CUresult(*)(CUfunction,
@@ -340,7 +340,7 @@ bool NvidiaDriver::run_sm86_smoke(std::string* error) {
 
         const auto memcpy_htod = sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
         const auto memcpy_dtoh = sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
-        const auto module_load = sym<ModuleLoadData>(handle_, "cuModuleLoadData");
+        const auto module_load_ex = sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
         const auto module_unload = sym<ModuleUnload>(handle_, "cuModuleUnload");
         const auto module_get_function = sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
         const auto launch = sym<LaunchKernel>(handle_, "cuLaunchKernel");
@@ -351,8 +351,46 @@ bool NvidiaDriver::run_sm86_smoke(std::string* error) {
         const auto before = values;
         check(handle_, memcpy_htod(memory.ptr(), values.data(), sizeof(values)), "cuMemcpyHtoD");
 
+        // sm_86 was introduced in PTX ISA 7.1. Keep the smoke PTX at the
+        // minimum compatible ISA so it works on old and new Ampere drivers.
+        // Always ask the driver for the JIT logs: CUDA_ERROR_INVALID_PTX alone
+        // is too opaque for bring-up/debugging.
+        inline constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        inline constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        inline constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        inline constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        inline constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(1)),
+        };
+
         CUmodule module{};
-        check(handle_, module_load(&module, kSmokePtx), "cuModuleLoadData");
+        const auto module_rc = module_load_ex(
+            &module,
+            kSmokePtx,
+            static_cast<unsigned int>(std::size(jit_options)),
+            jit_options,
+            jit_values);
+        if (module_rc != CUDA_SUCCESS) {
+            std::string detail = cuda_error(handle_, module_rc, "cuModuleLoadDataEx");
+            if (jit_error[0] != '\0') detail += std::string("\nPTX JIT error log:\n") + jit_error.data();
+            if (jit_info[0] != '\0') detail += std::string("\nPTX JIT info log:\n") + jit_info.data();
+            throw std::runtime_error(detail);
+        }
         try {
             CUfunction fn{};
             check(handle_, module_get_function(&fn, module, "q38_add_one"), "cuModuleGetFunction");
