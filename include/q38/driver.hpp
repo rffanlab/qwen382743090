@@ -29,6 +29,7 @@ public:
 
     bool probe_vmm(std::size_t bytes, std::string* error = nullptr);
     bool run_sm86_smoke(std::string* error = nullptr);
+    bool run_rmsnorm_smoke(std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr);
 
 private:
     void* handle_{nullptr};
