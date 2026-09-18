@@ -26,6 +26,9 @@ target_link_libraries(q38-gpu-smoke PRIVATE q38rt)
 add_executable(q38-plan src/plan.cpp)
 target_link_libraries(q38-plan PRIVATE q38rt)
 
+add_executable(q38-rmsnorm-smoke src/rmsnorm_smoke.cpp)
+target_link_libraries(q38-rmsnorm-smoke PRIVATE q38rt)
+
 if(Q38_BUILD_TESTS)
   enable_testing()
   add_executable(q38pack-smoke tests/q38pack_smoke.cpp)
