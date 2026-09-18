@@ -55,6 +55,12 @@ Runtime host 代码不需要 CUDA Toolkit 头文件；它在运行时 dlopen("li
 
 成功时应看到 `smoke: PASS (Driver API + VMM + PTX kernel)`。这会验证 sm_86、GPU VA 预留、物理显存映射、访问权限、PTX JIT、kernel launch 和 H2D/D2H 数据一致性。
 
+继续验证第一段真实模型数学（hidden=5120 的 RMSNorm baseline）：
+
+    ./build/q38-rmsnorm-smoke
+
+它会在 GPU 上执行 `sum(x²) -> rsqrt(mean+eps) -> x*weight`，并和 CPU reference 做逐元素误差检查。
+
 无 GPU 先检查 pack：
 
     ./build/q38-runtime --model /models/Qwen3.8-27B-Q4_K_M.q38pack --no-gpu
@@ -116,3 +122,13 @@ M1 的 Driver context、VMM allocation 和 PTX module/launch smoke 已经落地�
 - 不为了“看起来能跑”输出假 token。
 - 每个优化都必须有固定 workload 的前后数据。
 - 先只服务 RTX 3090 / SM86 / Qwen3.8-27B；有性能余量以后再谈通用化。
+
+## GPU VA placement
+
+转换出 Q38PACK 后，可以按 3090 实测的 2 MiB VMM granularity 查看权重虚拟地址规划：
+
+    ./build/q38-plan --model /models/Qwen3.8-27B.q38pack --page-bytes 2097152
+
+需要逐 tensor 查看 VA offset：
+
+    ./build/q38-plan --model /models/Qwen3.8-27B.q38pack --page-bytes 2097152 --list
