@@ -12,12 +12,15 @@ add_library(q38rt STATIC
     src/driver.cpp
     src/runtime.cpp
 )
-target_include_directories(q38rt PUBLIC include)
+target_include_directories(q38rt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(q38rt PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(q38rt PUBLIC dl)
+target_link_libraries(q38rt PUBLIC ${CMAKE_DL_LIBS})
 
 add_executable(q38-runtime src/main.cpp)
 target_link_libraries(q38-runtime PRIVATE q38rt)
+
+add_executable(q38-gpu-smoke src/gpu_smoke.cpp)
+target_link_libraries(q38-gpu-smoke PRIVATE q38rt)
 
 if(Q38_BUILD_TESTS)
   enable_testing()
