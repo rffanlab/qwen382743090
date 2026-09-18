@@ -21,14 +21,27 @@ public:
     [[nodiscard]] int device_ordinal() const noexcept { return device_ordinal_; }
     [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
     [[nodiscard]] std::size_t total_memory() const noexcept { return total_memory_; }
+    [[nodiscard]] int sm_major() const noexcept { return sm_major_; }
+    [[nodiscard]] int sm_minor() const noexcept { return sm_minor_; }
+    [[nodiscard]] bool is_sm86() const noexcept { return sm_major_ == 8 && sm_minor_ == 6; }
+    [[nodiscard]] std::size_t vmm_granularity() const noexcept { return vmm_granularity_; }
+    [[nodiscard]] bool vmm_available() const noexcept { return vmm_available_; }
+
+    bool probe_vmm(std::size_t bytes, std::string* error = nullptr);
+    bool run_sm86_smoke(std::string* error = nullptr);
 
 private:
     void* handle_{nullptr};
+    void* context_{nullptr};
     bool initialized_{false};
     int driver_version_{0};
     int device_ordinal_{0};
+    int sm_major_{0};
+    int sm_minor_{0};
     std::string device_name_;
     std::size_t total_memory_{0};
+    std::size_t vmm_granularity_{0};
+    bool vmm_available_{false};
 };
 
 } // namespace q38
