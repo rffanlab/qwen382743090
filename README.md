@@ -57,6 +57,12 @@ Runtime host 代码不需要 CUDA Toolkit 头文件；它在运行时 dlopen("li
 
     ./build/q38-runtime --model /models/Qwen3.8-27B-Q4_K_M.q38pack
 
+真正跑一遍 Driver API + VMM + PTX kernel 硬件烟测：
+
+    ./build/q38-runtime --model /models/Qwen3.8-27B-Q4_K_M.q38pack --gpu-smoke
+
+成功时应看到 `gpu smoke: PASS (Driver API + VMM + PTX kernel)`。这一步会验证 sm_86、GPU VA 预留、物理显存映射、访问权限、PTX JIT、kernel launch 和 H2D/D2H 数据一致性。
+
 ## 3. OpenAI 兼容接口
 
 启动：
@@ -87,12 +93,12 @@ Native decode 未完成时，/v1/chat/completions 会返回 OpenAI 风格的 503
 
 ## 接下来
 
-下一阶段不会先做 HTTP 花活，而是直接进入 GPU bring-up：
+M1 的 Driver context、VMM allocation 和 PTX module/launch smoke 已经落地。下一阶段直接进入模型执行：
 
-1. Driver API context + VMM allocator；
-2. cuModuleLoadData 加载 PTX/CUBIN；
-3. Q38PACK tensor → GPU VA placement；
-4. RMSNorm / dequant-GEMV 最小 kernel；
+1. Q38PACK tensor → GPU VA placement；
+2. RMSNorm + FP16/BF16 baseline kernel；
+3. Q4_K/Q4_0 dequant-GEMV；
+4. dense FFN 与 residual；
 5. 用 llama.cpp 固定 logits 做逐层 oracle；
 6. 再进入 DeltaNet、full attention、Q4 KV 和 MTP。
 
