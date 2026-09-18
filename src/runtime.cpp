@@ -24,6 +24,10 @@ RuntimeInfo Runtime::info() const {
     out.driver_version = driver_.driver_version();
     out.device_name = driver_.device_name();
     out.device_memory = driver_.total_memory();
+    out.sm_major = driver_.sm_major();
+    out.sm_minor = driver_.sm_minor();
+    out.vmm_available = driver_.vmm_available();
+    out.vmm_granularity = driver_.vmm_granularity();
     out.native_decode_ready = native_decode_ready_;
     return out;
 }
