@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cmath>
 #include <dlfcn.h>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 #include <string>
 
 namespace q38 {
@@ -233,6 +235,92 @@ DONE:
 }
 )ptx";
 
+constexpr const char* kRmsNormPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_sumsq(
+    .param .u64 p_x,
+    .param .u64 p_sumsq,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<5>;
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_sumsq];
+    ld.param.u32 %r1, [p_n];
+
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mad.lo.s32 %r5, %r3, %r4, %r2;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra SUM_DONE;
+
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    mul.rn.f32 %f2, %f1, %f1;
+    atom.global.add.f32 %f3, [%rd2], %f2;
+
+SUM_DONE:
+    ret;
+}
+
+.visible .entry q38_rmsnorm_apply(
+    .param .u64 p_x,
+    .param .u64 p_weight,
+    .param .u64 p_out,
+    .param .u64 p_sumsq,
+    .param .u32 p_n,
+    .param .f32 p_eps
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.u64 %rd4, [p_sumsq];
+    ld.param.u32 %r1, [p_n];
+    ld.param.f32 %f1, [p_eps];
+
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mad.lo.s32 %r5, %r3, %r4, %r2;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra APPLY_DONE;
+
+    ld.global.f32 %f2, [%rd4];
+    cvt.rn.f32.u32 %f3, %r1;
+    div.rn.f32 %f4, %f2, %f3;
+    add.rn.f32 %f4, %f4, %f1;
+    rsqrt.approx.f32 %f5, %f4;
+
+    mul.wide.u32 %rd5, %r5, 4;
+    add.s64 %rd6, %rd1, %rd5;
+    add.s64 %rd7, %rd2, %rd5;
+    add.s64 %rd8, %rd3, %rd5;
+    ld.global.f32 %f6, [%rd6];
+    ld.global.f32 %f7, [%rd7];
+    mul.rn.f32 %f8, %f6, %f5;
+    mul.rn.f32 %f9, %f8, %f7;
+    st.global.f32 [%rd8], %f9;
+
+APPLY_DONE:
+    ret;
+}
+)ptx";
+
 } // namespace
 
 NvidiaDriver::~NvidiaDriver() { close(); }
@@ -410,6 +498,161 @@ bool NvidiaDriver::run_sm86_smoke(std::string* error) {
             if (values[i] != before[i] + 1) {
                 throw std::runtime_error("SM86 smoke produced incorrect output at index " + std::to_string(i));
             }
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool NvidiaDriver::run_rmsnorm_smoke(std::string* error, double* max_abs_error, double* max_rel_error) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error("q38 RMSNorm smoke requires compute capability 8.6; detected sm_" +
+                                     std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+
+        constexpr std::uint32_t n = 5120;
+        constexpr float eps = 1.0e-6f;
+        constexpr unsigned int block = 256;
+        constexpr unsigned int grid = (n + block - 1) / block;
+        const std::size_t vec_bytes = static_cast<std::size_t>(n) * sizeof(float);
+        const std::size_t x_off = 0;
+        const std::size_t w_off = x_off + vec_bytes;
+        const std::size_t y_off = w_off + vec_bytes;
+        const std::size_t s_off = y_off + vec_bytes;
+        const std::size_t total_bytes = s_off + sizeof(float);
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD = CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH = CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using MemsetD32 = CUresult(*)(CUdeviceptr, unsigned int, std::size_t);
+        using ModuleLoadDataEx = CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction = CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel = CUresult(*)(CUfunction,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod = sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh = sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto memset_d32 = sym<MemsetD32>(handle_, "cuMemsetD32_v2");
+        const auto module_load_ex = sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload = sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function = sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch = sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync = sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        std::vector<float> x(n), weight(n), out(n), reference(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const float fi = static_cast<float>(i);
+            x[i] = std::sin(fi * 0.013f) * 0.75f + std::cos(fi * 0.007f) * 0.25f;
+            weight[i] = 0.8f + static_cast<float>(i % 37) * 0.01f;
+        }
+
+        double sumsq = 0.0;
+        for (float v : x) sumsq += static_cast<double>(v) * static_cast<double>(v);
+        const double inv_rms = 1.0 / std::sqrt(sumsq / static_cast<double>(n) + static_cast<double>(eps));
+        for (std::uint32_t i = 0; i < n; ++i) {
+            reference[i] = static_cast<float>(static_cast<double>(x[i]) * inv_rms * static_cast<double>(weight[i]));
+        }
+
+        const CUdeviceptr base = memory.ptr();
+        const CUdeviceptr x_ptr = base + x_off;
+        const CUdeviceptr w_ptr = base + w_off;
+        const CUdeviceptr y_ptr = base + y_off;
+        const CUdeviceptr s_ptr = base + s_off;
+
+        check(handle_, memcpy_htod(x_ptr, x.data(), vec_bytes), "cuMemcpyHtoD(x)");
+        check(handle_, memcpy_htod(w_ptr, weight.data(), vec_bytes), "cuMemcpyHtoD(weight)");
+        check(handle_, memset_d32(s_ptr, 0, 1), "cuMemsetD32(sumsq)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto module_rc = module_load_ex(
+            &module,
+            kRmsNormPtx,
+            static_cast<unsigned int>(sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (module_rc != CUDA_SUCCESS) {
+            std::string detail = cuda_error(handle_, module_rc, "cuModuleLoadDataEx(RMSNorm)");
+            if (jit_error[0] != '\0') detail += std::string("\nPTX JIT error log:\n") + jit_error.data();
+            if (jit_info[0] != '\0') detail += std::string("\nPTX JIT info log:\n") + jit_info.data();
+            throw std::runtime_error(detail);
+        }
+
+        try {
+            CUfunction sum_fn{}, apply_fn{};
+            check(handle_, module_get_function(&sum_fn, module, "q38_sumsq"), "cuModuleGetFunction(q38_sumsq)");
+            check(handle_, module_get_function(&apply_fn, module, "q38_rmsnorm_apply"), "cuModuleGetFunction(q38_rmsnorm_apply)");
+
+            CUdeviceptr sx = x_ptr;
+            CUdeviceptr ss = s_ptr;
+            std::uint32_t count = n;
+            void* sum_params[] = {&sx, &ss, &count};
+            check(handle_, launch(sum_fn, grid, 1, 1, block, 1, 1, 0, nullptr, sum_params, nullptr),
+                  "cuLaunchKernel(q38_sumsq)");
+
+            CUdeviceptr ax = x_ptr;
+            CUdeviceptr aw = w_ptr;
+            CUdeviceptr ay = y_ptr;
+            CUdeviceptr as = s_ptr;
+            float kernel_eps = eps;
+            void* apply_params[] = {&ax, &aw, &ay, &as, &count, &kernel_eps};
+            check(handle_, launch(apply_fn, grid, 1, 1, block, 1, 1, 0, nullptr, apply_params, nullptr),
+                  "cuLaunchKernel(q38_rmsnorm_apply)");
+            check(handle_, sync(), "cuCtxSynchronize(RMSNorm)");
+            check(handle_, memcpy_dtoh(out.data(), y_ptr, vec_bytes), "cuMemcpyDtoH(RMSNorm)");
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+        check(handle_, module_unload(module), "cuModuleUnload(RMSNorm)");
+
+        double abs_max = 0.0;
+        double rel_max = 0.0;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const double got = static_cast<double>(out[i]);
+            const double ref = static_cast<double>(reference[i]);
+            const double abs_err = std::abs(got - ref);
+            const double rel_err = abs_err / std::max(1.0e-6, std::abs(ref));
+            abs_max = std::max(abs_max, abs_err);
+            rel_max = std::max(rel_max, rel_err);
+        }
+        if (max_abs_error) *max_abs_error = abs_max;
+        if (max_rel_error) *max_rel_error = rel_max;
+
+        if (!(abs_max <= 5.0e-4 && rel_max <= 5.0e-4)) {
+            std::ostringstream oss;
+            oss << "RMSNorm numeric mismatch: max_abs=" << abs_max << " max_rel=" << rel_max;
+            throw std::runtime_error(oss.str());
         }
         return true;
     } catch (const std::exception& e) {
