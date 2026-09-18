@@ -11,6 +11,7 @@ add_library(q38rt STATIC
     src/q38pack.cpp
     src/driver.cpp
     src/runtime.cpp
+    src/placement.cpp
 )
 target_include_directories(q38rt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(q38rt PRIVATE -Wall -Wextra -Wpedantic)
@@ -22,9 +23,15 @@ target_link_libraries(q38-runtime PRIVATE q38rt)
 add_executable(q38-gpu-smoke src/gpu_smoke.cpp)
 target_link_libraries(q38-gpu-smoke PRIVATE q38rt)
 
+add_executable(q38-plan src/plan.cpp)
+target_link_libraries(q38-plan PRIVATE q38rt)
+
 if(Q38_BUILD_TESTS)
   enable_testing()
   add_executable(q38pack-smoke tests/q38pack_smoke.cpp)
   target_link_libraries(q38pack-smoke PRIVATE q38rt)
   add_test(NAME q38pack-smoke COMMAND q38pack-smoke)
+  add_executable(q38-placement-smoke tests/placement_smoke.cpp)
+  target_link_libraries(q38-placement-smoke PRIVATE q38rt)
+  add_test(NAME q38-placement-smoke COMMAND q38-placement-smoke)
 endif()
