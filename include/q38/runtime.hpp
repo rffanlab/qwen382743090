@@ -16,6 +16,10 @@ struct RuntimeInfo {
     int driver_version{};
     std::string device_name;
     std::size_t device_memory{};
+    int sm_major{};
+    int sm_minor{};
+    bool vmm_available{};
+    std::size_t vmm_granularity{};
     bool native_decode_ready{};
 };
 
@@ -24,6 +28,7 @@ public:
     void load(const std::filesystem::path& model_path, bool require_gpu = true);
     [[nodiscard]] RuntimeInfo info() const;
     [[nodiscard]] const PackFile& pack() const noexcept { return pack_; }
+    bool gpu_smoke(std::string* error = nullptr) { return driver_.run_sm86_smoke(error); }
 
 private:
     std::filesystem::path model_path_;
