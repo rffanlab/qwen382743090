@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python converter tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build host runtime
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+      - name: CTest
+        run: ctest --test-dir build --output-on-failure
