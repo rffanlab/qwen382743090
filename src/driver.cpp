@@ -355,11 +355,11 @@ bool NvidiaDriver::run_sm86_smoke(std::string* error) {
         // minimum compatible ISA so it works on old and new Ampere drivers.
         // Always ask the driver for the JIT logs: CUDA_ERROR_INVALID_PTX alone
         // is too opaque for bring-up/debugging.
-        inline constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
-        inline constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
-        inline constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
-        inline constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
-        inline constexpr int CU_JIT_LOG_VERBOSE = 12;
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
 
         std::array<char, 8192> jit_info{};
         std::array<char, 8192> jit_error{};
@@ -382,7 +382,7 @@ bool NvidiaDriver::run_sm86_smoke(std::string* error) {
         const auto module_rc = module_load_ex(
             &module,
             kSmokePtx,
-            static_cast<unsigned int>(std::size(jit_options)),
+            static_cast<unsigned int>(sizeof(jit_options) / sizeof(jit_options[0])),
             jit_options,
             jit_values);
         if (module_rc != CUDA_SUCCESS) {
