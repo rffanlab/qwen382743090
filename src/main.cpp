@@ -13,14 +13,16 @@ int main(int argc, char** argv) {
     std::string model;
     bool no_gpu = false;
     bool list_tensors = false;
+    bool gpu_smoke = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--model" && i + 1 < argc) model = argv[++i];
         else if (arg == "--no-gpu") no_gpu = true;
         else if (arg == "--list-tensors") list_tensors = true;
+        else if (arg == "--gpu-smoke") gpu_smoke = true;
         else if (arg == "--help") {
-            std::cout << "usage: q38-runtime --model MODEL.q38pack [--no-gpu] [--list-tensors]\n";
+            std::cout << "usage: q38-runtime --model MODEL.q38pack [--no-gpu] [--list-tensors] [--gpu-smoke]\n";
             return 0;
         } else {
             throw std::runtime_error("unknown argument: " + arg);
@@ -47,8 +49,21 @@ int main(int argc, char** argv) {
             std::cout << "driver version: " << info.driver_version << "\n";
             std::cout << "device: " << info.device_name << "\n";
             std::cout << "VRAM: " << gib(info.device_memory) << " GiB\n";
+            std::cout << "compute capability: sm_" << info.sm_major << info.sm_minor << "\n";
+            std::cout << "VMM: " << (info.vmm_available ? "available" : "not available");
+            if (info.vmm_available) std::cout << " (granularity " << info.vmm_granularity << " bytes)";
+            std::cout << "\n";
         }
         std::cout << "native decode: " << (info.native_decode_ready ? "ready" : "not implemented yet") << "\n";
+
+        if (gpu_smoke) {
+            std::string error;
+            if (!runtime.gpu_smoke(&error)) {
+                std::cerr << "gpu smoke: FAILED: " << error << "\n";
+                return 3;
+            }
+            std::cout << "gpu smoke: PASS (Driver API + VMM + PTX kernel)\n";
+        }
 
         if (list_tensors) {
             for (const auto& t : runtime.pack().tensors()) {
