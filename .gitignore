@@ -1,0 +1,7 @@
+build/
+__pycache__/
+*.pyc
+*.q38pack
+*.gguf
+.venv/
+.pytest_cache/
