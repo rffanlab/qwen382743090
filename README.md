@@ -1085,3 +1085,58 @@ The benchmark reports:
 
 Weight upload and PTX JIT are excluded from timing. The target is single-token
 decode only; prefill/chunked GDN remains separate future work.
+
+
+### Complete recurrent layer0 result
+
+The first complete recurrent decoder layer is now validated end-to-end on RTX 3090:
+
+    attention_ms:          0.2091
+    post_norm_ms:          0.0140
+    ffn_gate_ms:           0.0858
+    ffn_up_ms:             0.0932
+    ffn_pointwise_ms:      0.0020
+    ffn_down_ms:           0.1404
+    ffn_ms:                0.3394
+    sum_stage_ms:          0.5486
+    layer_chain_ms:        0.5654
+    layer_per_second:      1768.5229
+
+Correctness:
+
+    ffn_norm_max_abs_error:    7.152557e-07
+    ffn_gate_up_max_abs_error: 2.384186e-07
+    ffn_down_max_abs_error:    9.222562e-08
+    layer_output_max_abs_error:9.977963e-08
+
+This establishes a complete single-token native execution path for one recurrent
+Qwen3.8/Qwen35 decoder layer.
+
+### Generic recurrent-layer runner and 64-layer topology
+
+The Runtime no longer assumes only `blk.0`. Recurrent layers can be detected
+from their real tensor set and routed through the same shape-specialized native
+driver implementation.
+
+Run the topology inspector:
+
+    ./build/q38-layer-topology --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+It prints all 64 main layers as:
+
+    RECURRENT
+    FULL_ATTENTION
+    MISSING
+
+and reports whether each recurrent layer is already compatible with the retained
+native kernel set. It also prints the actual tensor signature of the first
+full-attention layer and checks whether all full-attention layers share the same
+signature.
+
+Run any recurrent layer directly:
+
+    ./build/q38-recurrent-layer --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --layer N
+
+The current driver remains dimension-specialized for Qwen3.8-27B, but it is no
+longer layer-index-specialized; the Runtime supplies the selected layer's real
+weights.
