@@ -613,6 +613,106 @@ Q4G_DONE:
 }
 )ptx";
 
+constexpr const char* kIQ4XSDequantPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_dequant_iq4xs_block(
+    .param .u64 p_block,
+    .param .u64 p_out
+)
+{
+    .reg .pred %p<10>;
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<10>;
+
+    ld.param.u64 %rd1, [p_block];
+    ld.param.u64 %rd2, [p_out];
+
+    mov.u32 %r1, %tid.x;
+    setp.ge.u32 %p1, %r1, 256;
+    @%p1 bra IQ4_DONE;
+
+    // group 0..7, lane 0..31
+    shr.u32 %r2, %r1, 5;
+    and.b32 %r3, %r1, 31;
+
+    // d (fp16)
+    ld.global.b16 %r30, [%rd1+0];
+    cvt.f32.f16 %f1, %r30;
+
+    // 6-bit group scale:
+    // low 4 bits packed two-per-byte at +4
+    // high 2 bits packed in uint16 at +2
+    ld.global.b16 %r31, [%rd1+2];
+
+    shr.u32 %r4, %r2, 1;
+    cvt.u64.u32 %rd3, %r4;
+    add.s64 %rd4, %rd1, 4;
+    add.s64 %rd5, %rd4, %rd3;
+    ld.global.u8 %r5, [%rd5];
+
+    and.b32 %r6, %r2, 1;
+    shl.b32 %r6, %r6, 2;
+    shr.u32 %r7, %r5, %r6;
+    and.b32 %r7, %r7, 15;
+
+    shl.b32 %r8, %r2, 1;
+    shr.u32 %r9, %r31, %r8;
+    and.b32 %r9, %r9, 3;
+    shl.b32 %r9, %r9, 4;
+    or.b32 %r10, %r7, %r9;
+    sub.s32 %r11, %r10, 32;
+
+    cvt.rn.f32.s32 %f2, %r11;
+    mul.rn.f32 %f3, %f1, %f2;
+
+    // qs starts at +8, 16 bytes per 32-value group.
+    and.b32 %r12, %r3, 15;
+    shl.b32 %r13, %r2, 4;
+    add.u32 %r13, %r13, %r12;
+    cvt.u64.u32 %rd6, %r13;
+    add.s64 %rd7, %rd1, 8;
+    add.s64 %rd8, %rd7, %rd6;
+    ld.global.u8 %r14, [%rd8];
+
+    setp.lt.u32 %p2, %r3, 16;
+    @%p2 and.b32 %r15, %r14, 15;
+    @!%p2 shr.u32 %r15, %r14, 4;
+
+    // Non-linear IQ4 codebook.
+    mov.s32 %r16, 0;
+    setp.eq.u32 %p3, %r15, 0;  @%p3 mov.s32 %r16, -127;
+    setp.eq.u32 %p3, %r15, 1;  @%p3 mov.s32 %r16, -104;
+    setp.eq.u32 %p3, %r15, 2;  @%p3 mov.s32 %r16, -83;
+    setp.eq.u32 %p3, %r15, 3;  @%p3 mov.s32 %r16, -65;
+    setp.eq.u32 %p3, %r15, 4;  @%p3 mov.s32 %r16, -49;
+    setp.eq.u32 %p3, %r15, 5;  @%p3 mov.s32 %r16, -35;
+    setp.eq.u32 %p3, %r15, 6;  @%p3 mov.s32 %r16, -22;
+    setp.eq.u32 %p3, %r15, 7;  @%p3 mov.s32 %r16, -10;
+    setp.eq.u32 %p3, %r15, 8;  @%p3 mov.s32 %r16, 1;
+    setp.eq.u32 %p3, %r15, 9;  @%p3 mov.s32 %r16, 13;
+    setp.eq.u32 %p3, %r15, 10; @%p3 mov.s32 %r16, 25;
+    setp.eq.u32 %p3, %r15, 11; @%p3 mov.s32 %r16, 38;
+    setp.eq.u32 %p3, %r15, 12; @%p3 mov.s32 %r16, 53;
+    setp.eq.u32 %p3, %r15, 13; @%p3 mov.s32 %r16, 69;
+    setp.eq.u32 %p3, %r15, 14; @%p3 mov.s32 %r16, 89;
+    setp.eq.u32 %p3, %r15, 15; @%p3 mov.s32 %r16, 113;
+
+    cvt.rn.f32.s32 %f4, %r16;
+    mul.rn.f32 %f5, %f3, %f4;
+
+    mul.wide.u32 %rd9, %r1, 4;
+    add.s64 %rd10, %rd2, %rd9;
+    st.global.f32 [%rd10], %f5;
+
+IQ4_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ5KDequantPtx = R"ptx(
 .version 7.1
 .target sm_86
