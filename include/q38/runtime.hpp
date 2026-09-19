@@ -50,6 +50,11 @@ public:
         Layer0RecurrentFrontStats* stats = nullptr,
         std::string* error = nullptr);
 
+    bool run_layer0_recurrent_attention(
+        float rms_eps = 1.0e-6f,
+        Layer0RecurrentAttentionStats* stats = nullptr,
+        std::string* error = nullptr);
+
 private:
     std::filesystem::path model_path_;
     PackFile pack_;
