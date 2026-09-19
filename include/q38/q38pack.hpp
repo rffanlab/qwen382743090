@@ -10,7 +10,8 @@
 namespace q38 {
 
 inline constexpr std::array<char, 8> kPackMagic{'Q','3','8','P','A','C','K','\0'};
-inline constexpr std::uint32_t kPackVersion = 1;
+inline constexpr std::uint32_t kPackVersion = 2;
+inline constexpr std::uint32_t kPackMinVersion = 1;
 inline constexpr std::uint32_t kPackHeaderBytes = 256;
 inline constexpr std::uint32_t kTensorEntryBytes = 256;
 
@@ -24,6 +25,11 @@ enum class TensorRole : std::uint32_t {
     FeedForward = 6,
     Norm = 7,
     Mtp = 8,
+};
+
+enum class TensorLayout : std::uint32_t {
+    GgufNative = 0,
+    Sm86Q5KSoA = 1,
 };
 
 struct PackHeader {
@@ -56,6 +62,10 @@ struct TensorRecord {
     std::uint64_t source_offset{};
     TensorRole role{TensorRole::Unknown};
     std::uint32_t flags{};
+    TensorLayout layout{TensorLayout::GgufNative};
+    std::uint32_t layout_flags{};
+    std::uint64_t aux0_offset{};
+    std::uint64_t aux1_offset{};
 };
 
 class PackFile {
@@ -76,6 +86,7 @@ public:
     [[nodiscard]] std::string_view manifest_json() const noexcept { return manifest_; }
     [[nodiscard]] const TensorRecord* find_tensor(std::string_view name) const noexcept;
     [[nodiscard]] const std::byte* tensor_data(const TensorRecord& tensor) const;
+    [[nodiscard]] const std::byte* tensor_aux_data(const TensorRecord& tensor, int index) const;
 
 private:
     int fd_{-1};
