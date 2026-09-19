@@ -36,6 +36,56 @@ float fp16_to_fp32(std::uint16_t h) noexcept {
     return std::bit_cast<float>(f);
 }
 
+
+std::uint16_t fp32_to_fp16(float value) noexcept {
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+    const std::uint32_t sign = (bits >> 16) & 0x8000u;
+    const std::uint32_t exp = (bits >> 23) & 0xffu;
+    const std::uint32_t mant = bits & 0x7fffffu;
+
+    if (exp == 0xffu) {
+        return static_cast<std::uint16_t>(
+            sign | 0x7c00u | (mant ? 0x0200u : 0u));
+    }
+
+    const int new_exp = static_cast<int>(exp) - 127 + 15;
+    if (new_exp >= 31) {
+        return static_cast<std::uint16_t>(sign | 0x7c00u);
+    }
+    if (new_exp <= 0) {
+        if (new_exp < -10) {
+            return static_cast<std::uint16_t>(sign);
+        }
+        std::uint32_t m = mant | 0x800000u;
+        const int shift = 14 - new_exp;
+        std::uint32_t half_m = m >> shift;
+        const std::uint32_t round_bit = 1u << (shift - 1);
+        if ((m & round_bit) &&
+            ((m & (round_bit - 1)) || (half_m & 1u))) {
+            ++half_m;
+        }
+        return static_cast<std::uint16_t>(sign | half_m);
+    }
+
+    std::uint32_t half_exp =
+        static_cast<std::uint32_t>(new_exp) << 10;
+    std::uint32_t half_m = mant >> 13;
+    const std::uint32_t round = mant & 0x1fffu;
+    if (round > 0x1000u ||
+        (round == 0x1000u && (half_m & 1u))) {
+        ++half_m;
+        if (half_m == 0x400u) {
+            half_m = 0;
+            half_exp += 0x400u;
+            if (half_exp >= 0x7c00u) {
+                half_exp = 0x7c00u;
+            }
+        }
+    }
+    return static_cast<std::uint16_t>(
+        sign | half_exp | half_m);
+}
+
 static void get_scale_min_k4(int j, const std::uint8_t* q, std::uint8_t& d, std::uint8_t& m) noexcept {
     if (j < 4) {
         d = q[j] & 63u;
@@ -143,6 +193,58 @@ int nearest_int_q38(float fval) noexcept {
 }
 
 } // namespace
+
+
+std::vector<std::byte> quantize_q8_1_cpu(
+    const float* values, std::size_t count) {
+    if (!values) throw std::invalid_argument("Q8_1 source is null");
+    if (count == 0 || count % kQ8_1ValuesPerBlock != 0) {
+        throw std::invalid_argument(
+            "Q8_1 count must be a positive multiple of 32");
+    }
+
+    const std::size_t blocks =
+        count / kQ8_1ValuesPerBlock;
+    std::vector<std::byte> out(
+        blocks * kQ8_1BytesPerBlock);
+
+    for (std::size_t ib = 0; ib < blocks; ++ib) {
+        const float* x =
+            values + ib * kQ8_1ValuesPerBlock;
+        std::byte* block =
+            out.data() + ib * kQ8_1BytesPerBlock;
+
+        float amax = 0.0f;
+        for (std::size_t j = 0;
+             j < kQ8_1ValuesPerBlock; ++j) {
+            amax = std::max(amax, std::fabs(x[j]));
+        }
+
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        const std::uint16_t d_half = fp32_to_fp16(d);
+        std::memcpy(block + 0, &d_half, sizeof(d_half));
+
+        auto* qs =
+            reinterpret_cast<std::int8_t*>(block + 4);
+        int sum = 0;
+        for (std::size_t j = 0;
+             j < kQ8_1ValuesPerBlock; ++j) {
+            const float scaled = x[j] * id;
+            int q = static_cast<int>(std::round(scaled));
+            q = std::clamp(q, -127, 127);
+            qs[j] = static_cast<std::int8_t>(q);
+            sum += q;
+        }
+
+        const float s = static_cast<float>(sum) * d;
+        const std::uint16_t s_half = fp32_to_fp16(s);
+        std::memcpy(block + 2, &s_half, sizeof(s_half));
+    }
+
+    return out;
+}
 
 std::vector<std::byte> quantize_q8_k_cpu(const float* values, std::size_t count) {
     if (!values) throw std::invalid_argument("Q8_K source is null");
