@@ -1,4 +1,4 @@
-#include "q38/q38pack.hpp"
+#include "q38/runtime.hpp"
 
 #include <cstdint>
 #include <iomanip>
@@ -43,15 +43,11 @@ static const char* layout_name(q38::TensorLayout layout) {
 }
 
 static const char* support_name(const q38::TensorRecord& t) {
-    if (t.ggml_type == 0 && t.layout == q38::TensorLayout::GgufNative) {
-        return "F32_DIRECT";
+    const auto kind = q38::select_projection_kernel(t);
+    if (kind != q38::ProjectionKernelKind::Unsupported) {
+        return q38::projection_kernel_name(kind);
     }
-    if (t.ggml_type == 13 && t.layout == q38::TensorLayout::Sm86Q5KSoA) {
-        return "Q5K_SM86_VEC_READY";
-    }
-    if (t.ggml_type == 12 && t.layout == q38::TensorLayout::GgufNative) return "Q4K_NATIVE_READY";
     if (t.ggml_type == 14) return "NEED_Q6K_GEMV";
-    if (t.ggml_type == 23 && t.layout == q38::TensorLayout::GgufNative) return "IQ4XS_NATIVE_PRMT_READY";
     if (t.ggml_type == 8) return "NEED_Q8_0_GEMV";
     return "NEED_KERNEL";
 }
