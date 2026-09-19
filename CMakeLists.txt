@@ -48,6 +48,9 @@ target_link_libraries(q38-q5k-sm86-gemv PRIVATE q38rt)
 add_executable(q38-layer0-gate src/layer0_gate.cpp)
 target_link_libraries(q38-layer0-gate PRIVATE q38rt)
 
+add_executable(q38-layer0-map src/layer0_map.cpp)
+target_link_libraries(q38-layer0-map PRIVATE q38rt)
+
 if(Q38_BUILD_TESTS)
   enable_testing()
   add_executable(q38pack-smoke tests/q38pack_smoke.cpp)
