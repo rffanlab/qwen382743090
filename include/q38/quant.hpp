@@ -23,6 +23,7 @@ void dequantize_q4_k_block_cpu(const std::byte* block, std::array<float, kQ4KVal
 void dequantize_q5_k_block_cpu(const std::byte* block, std::array<float, kQ4KValuesPerBlock>& out);
 std::vector<std::byte> quantize_q8_k_cpu(const float* values, std::size_t count);
 std::vector<std::byte> quantize_q8_1_cpu(const float* values, std::size_t count);
+void dequantize_q8_1_block_cpu(const std::byte* block, std::array<float, kQ8_1ValuesPerBlock>& out);
 void dequantize_q8_k_block_cpu(const std::byte* block, std::array<float, kQ4KValuesPerBlock>& out);
 void repack_q5_k_sm86_block(const std::byte* source, std::byte* destination);
 void dequantize_q5_k_sm86_block_cpu(const std::byte* block, std::array<float, kQ4KValuesPerBlock>& out);
