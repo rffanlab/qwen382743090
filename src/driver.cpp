@@ -2057,7 +2057,7 @@ bool NvidiaDriver::run_q5k_q8k_gemv_smoke(
         CUmodule module{};
         const auto module_rc = module_load_ex(
             &module,
-            kQ5KQ8KGemvPtx,
+            kQ5KQ8KDp4aGemvPtx,
             static_cast<unsigned int>(sizeof(jit_options) / sizeof(jit_options[0])),
             jit_options,
             jit_values);
@@ -2070,8 +2070,8 @@ bool NvidiaDriver::run_q5k_q8k_gemv_smoke(
 
         CUfunction fn{};
         try {
-            check(handle_, module_get_function(&fn, module, "q38_q5k_q8k_gemv"),
-                  "cuModuleGetFunction(q38_q5k_q8k_gemv)");
+            check(handle_, module_get_function(&fn, module, "q38_q5k_q8k_dp4a_gemv"),
+                  "cuModuleGetFunction(q38_q5k_q8k_dp4a_gemv)");
 
             CUdeviceptr arg_w = matrix_ptr;
             CUdeviceptr arg_q8 = q8_ptr;
@@ -2080,8 +2080,9 @@ bool NvidiaDriver::run_q5k_q8k_gemv_smoke(
             std::uint32_t arg_rows = rows;
             void* params[] = {&arg_w, &arg_q8, &arg_y, &arg_cols, &arg_rows};
 
-            check(handle_, launch(fn, rows, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr),
-                  "cuLaunchKernel(q38_q5k_q8k_gemv)");
+            const unsigned int grid_rows4 = (rows + 3u) / 4u;
+            check(handle_, launch(fn, grid_rows4, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
+                  "cuLaunchKernel(q38_q5k_q8k_dp4a_gemv)");
             check(handle_, sync(), "cuCtxSynchronize(Q5_K x Q8_K correctness)");
             check(handle_, memcpy_dtoh(y.data(), y_ptr, y_bytes), "cuMemcpyDtoH(Q5_K x Q8_K)");
 
@@ -2125,8 +2126,8 @@ bool NvidiaDriver::run_q5k_q8k_gemv_smoke(
             constexpr int kIters = 50;
             const auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < kIters; ++i) {
-                check(handle_, launch(fn, rows, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr),
-                      "cuLaunchKernel(q38_q5k_q8k_gemv benchmark)");
+                check(handle_, launch(fn, grid_rows4, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
+                      "cuLaunchKernel(q38_q5k_q8k_dp4a_gemv benchmark)");
             }
             check(handle_, sync(), "cuCtxSynchronize(Q5_K x Q8_K benchmark)");
             const auto t1 = std::chrono::steady_clock::now();
