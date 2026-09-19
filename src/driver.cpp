@@ -3054,6 +3054,271 @@ bool NvidiaDriver::run_iq4xs_gemv_smoke(
     }
 }
 
+
+bool NvidiaDriver::run_iq4xs_sm86_gemv_smoke(
+    const std::byte* repacked_matrix,
+    std::size_t scale_offset,
+    std::size_t qs_offset,
+    std::uint32_t cols,
+    std::uint32_t rows,
+    std::string* error,
+    double* max_abs_error,
+    double* max_rel_error,
+    double* milliseconds,
+    double* original_equiv_gbps,
+    double* physical_gbps) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error("q38 SM86 IQ4_XS GEMV requires sm_86; detected sm_" +
+                                     std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (!repacked_matrix) throw std::invalid_argument("SM86 IQ4_XS matrix is null");
+        if (cols == 0 || rows == 0 || (cols % kQ4KValuesPerBlock) != 0) {
+            throw std::invalid_argument("SM86 IQ4_XS GEMV requires non-zero rows and cols divisible by 256");
+        }
+
+        const std::size_t blocks_per_row = cols / kQ4KValuesPerBlock;
+        const std::size_t total_blocks =
+            static_cast<std::size_t>(rows) * blocks_per_row;
+        const std::size_t d_bytes = total_blocks * 2;
+        const std::size_t scale_bytes = total_blocks * 8;
+        const std::size_t qs_bytes = total_blocks * 128;
+        if (scale_offset < d_bytes || qs_offset < scale_offset + scale_bytes) {
+            throw std::invalid_argument("invalid SM86 IQ4_XS SoA offsets");
+        }
+
+        const std::size_t repacked_bytes = qs_offset + qs_bytes;
+        const std::size_t original_bytes =
+            total_blocks * kIQ4XSBytesPerBlock;
+        const std::size_t x_bytes =
+            static_cast<std::size_t>(cols) * sizeof(float);
+        const std::size_t y_bytes =
+            static_cast<std::size_t>(rows) * sizeof(float);
+
+        auto align256 = [](std::size_t v) {
+            return (v + 255u) & ~std::size_t(255u);
+        };
+        const std::size_t model_off = 0;
+        const std::size_t x_off = align256(repacked_bytes);
+        const std::size_t y_off = align256(x_off + x_bytes);
+        const std::size_t total_bytes = y_off + y_bytes;
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD = CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH = CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using ModuleLoadDataEx = CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction = CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel = CUresult(*)(CUfunction,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod =
+            sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh =
+            sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto module_load_ex =
+            sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload =
+            sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function =
+            sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch =
+            sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync =
+            sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        std::vector<float> x(cols), y(rows);
+        for (std::uint32_t i = 0; i < cols; ++i) {
+            const float fi = static_cast<float>(i);
+            x[i] = std::sin(fi * 0.017f) * 0.65f +
+                   std::cos(fi * 0.011f) * 0.35f;
+        }
+
+        const CUdeviceptr model_ptr = memory.ptr() + model_off;
+        const CUdeviceptr d_ptr = model_ptr;
+        const CUdeviceptr scale_ptr = model_ptr + scale_offset;
+        const CUdeviceptr qs_ptr = model_ptr + qs_offset;
+        const CUdeviceptr x_ptr = memory.ptr() + x_off;
+        const CUdeviceptr y_ptr = memory.ptr() + y_off;
+
+        check(handle_, memcpy_htod(
+            model_ptr, repacked_matrix, repacked_bytes),
+            "cuMemcpyHtoD(SM86 IQ4_XS SoA)");
+        check(handle_, memcpy_htod(
+            x_ptr, x.data(), x_bytes),
+            "cuMemcpyHtoD(SM86 IQ4_XS x)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto rc = module_load_ex(
+            &module,
+            kIQ4XSSm86SoAGemvPtx,
+            static_cast<unsigned int>(
+                sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (rc != CUDA_SUCCESS) {
+            std::string detail =
+                cuda_error(handle_, rc, "cuModuleLoadDataEx(SM86 IQ4_XS GEMV)");
+            if (jit_error[0] != '\0') {
+                detail += std::string("\nPTX JIT error log:\n") + jit_error.data();
+            }
+            if (jit_info[0] != '\0') {
+                detail += std::string("\nPTX JIT info log:\n") + jit_info.data();
+            }
+            throw std::runtime_error(detail);
+        }
+
+        try {
+            CUfunction fn{};
+            check(handle_, module_get_function(
+                &fn, module, "q38_iq4xs_sm86_soa_gemv"),
+                "cuModuleGetFunction(q38_iq4xs_sm86_soa_gemv)");
+
+            CUdeviceptr arg_d = d_ptr;
+            CUdeviceptr arg_scale = scale_ptr;
+            CUdeviceptr arg_qs = qs_ptr;
+            CUdeviceptr arg_x = x_ptr;
+            CUdeviceptr arg_y = y_ptr;
+            std::uint32_t arg_cols = cols;
+            std::uint32_t arg_rows = rows;
+            void* params[] = {
+                &arg_d, &arg_scale, &arg_qs, &arg_x, &arg_y,
+                &arg_cols, &arg_rows
+            };
+
+            check(handle_, launch(
+                fn, rows, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
+                "cuLaunchKernel(q38_iq4xs_sm86_soa_gemv)");
+            check(handle_, sync(),
+                  "cuCtxSynchronize(SM86 IQ4_XS correctness)");
+            check(handle_, memcpy_dtoh(
+                y.data(), y_ptr, y_bytes),
+                "cuMemcpyDtoH(SM86 IQ4_XS)");
+
+            const std::size_t checked_rows =
+                std::min<std::size_t>(rows, 8);
+            std::array<float, kQ4KValuesPerBlock> deq{};
+            std::array<std::byte, kIQ4XSSm86BytesPerBlock> block{};
+            double abs_max = 0.0;
+            double rel_max = 0.0;
+
+            for (std::size_t row = 0; row < checked_rows; ++row) {
+                double ref = 0.0;
+                for (std::size_t ib = 0; ib < blocks_per_row; ++ib) {
+                    const std::size_t block_index =
+                        row * blocks_per_row + ib;
+                    std::memcpy(
+                        block.data() + 0,
+                        repacked_matrix + block_index * 2,
+                        2);
+                    std::memcpy(
+                        block.data() + 2,
+                        repacked_matrix + scale_offset + block_index * 8,
+                        8);
+                    std::memcpy(
+                        block.data() + 10,
+                        repacked_matrix + qs_offset + block_index * 128,
+                        128);
+
+                    dequantize_iq4_xs_sm86_block_cpu(
+                        block.data(), deq);
+
+                    const std::size_t base =
+                        ib * kQ4KValuesPerBlock;
+                    for (std::size_t j = 0;
+                         j < kQ4KValuesPerBlock; ++j) {
+                        ref += static_cast<double>(deq[j]) *
+                               static_cast<double>(x[base + j]);
+                    }
+                }
+
+                const double got = static_cast<double>(y[row]);
+                const double abs_err = std::abs(got - ref);
+                const double rel_err =
+                    abs_err / std::max(1.0e-5, std::abs(ref));
+                abs_max = std::max(abs_max, abs_err);
+                rel_max = std::max(rel_max, rel_err);
+            }
+
+            if (max_abs_error) *max_abs_error = abs_max;
+            if (max_rel_error) *max_rel_error = rel_max;
+            if (!(abs_max <= 3.0e-3 && rel_max <= 3.0e-3)) {
+                std::ostringstream oss;
+                oss << "SM86 IQ4_XS GEMV mismatch: max_abs="
+                    << abs_max << " max_rel=" << rel_max;
+                throw std::runtime_error(oss.str());
+            }
+
+            constexpr int kIters = 50;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kIters; ++i) {
+                check(handle_, launch(
+                    fn, rows, 1, 1, 32, 1, 1, 0, nullptr,
+                    params, nullptr),
+                    "cuLaunchKernel(q38_iq4xs_sm86_soa_gemv benchmark)");
+            }
+            check(handle_, sync(),
+                  "cuCtxSynchronize(SM86 IQ4_XS benchmark)");
+            const auto t1 = std::chrono::steady_clock::now();
+
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(
+                    t1 - t0).count() /
+                static_cast<double>(kIters);
+            const double original_gbps =
+                static_cast<double>(original_bytes) /
+                (elapsed_ms / 1000.0) / 1.0e9;
+            const double physical =
+                static_cast<double>(repacked_bytes) /
+                (elapsed_ms / 1000.0) / 1.0e9;
+
+            if (milliseconds) *milliseconds = elapsed_ms;
+            if (original_equiv_gbps) {
+                *original_equiv_gbps = original_gbps;
+            }
+            if (physical_gbps) *physical_gbps = physical;
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+
+        check(handle_, module_unload(module),
+              "cuModuleUnload(SM86 IQ4_XS GEMV)");
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 bool NvidiaDriver::run_q5k_gemv_smoke(
     const std::byte* matrix,
     std::uint32_t cols,
