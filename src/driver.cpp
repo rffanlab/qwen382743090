@@ -1312,6 +1312,166 @@ Q6D_DONE:
 }
 )ptx";
 
+constexpr const char* kQ6KGemvScalarPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+// Golden Q6_K GEMV: exact element-index decode, one warp/output row.
+// Lane L owns elements L + 32*j for j=0..7 in every 256-value block.
+.visible .entry q38_q6k_gemv_f32_scalar(
+    .param .u64 p_weights,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<28>;
+    .reg .f32 %f<16>;
+
+    ld.param.u64 %rd1, [p_weights];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    setp.ge.u32 %p1, %r3, %r2;
+    @%p1 bra Q6S_DONE;
+    setp.ge.u32 %p2, %r4, 32;
+    @%p2 bra Q6S_DONE;
+
+    shr.u32 %r5, %r1, 8;       // blocks per row
+    mul.lo.u32 %r6, %r5, 210;
+    mul.wide.u32 %rd4, %r3, %r6;
+    add.s64 %rd5, %rd1, %rd4;
+
+    mov.u32 %r7, 0;             // block
+    mov.f32 %f10, 0f00000000;
+
+Q6S_BLOCK_LOOP:
+    setp.ge.u32 %p3, %r7, %r5;
+    @%p3 bra Q6S_BLOCKS_DONE;
+
+    mul.wide.u32 %rd6, %r7, 210;
+    add.s64 %rd7, %rd5, %rd6;
+
+    mov.u32 %r8, 0;             // j=0..7
+
+Q6S_J_LOOP:
+    setp.ge.u32 %p4, %r8, 8;
+    @%p4 bra Q6S_J_DONE;
+
+    // e = lane + 32*j
+    shl.b32 %r9, %r8, 5;
+    add.u32 %r9, %r9, %r4;
+
+    shr.u32 %r10, %r9, 7;      // half 0..1
+    and.b32 %r11, %r9, 127;
+    shr.u32 %r12, %r11, 5;     // quarter 0..3
+    and.b32 %r13, %r11, 31;    // l 0..31
+    shr.u32 %r14, %r13, 4;     // is 0..1
+
+    // ql index
+    shl.b32 %r15, %r10, 6;
+    and.b32 %r16, %r12, 1;
+    shl.b32 %r16, %r16, 5;
+    add.u32 %r17, %r15, %r16;
+    add.u32 %r17, %r17, %r13;
+    cvt.u64.u32 %rd8, %r17;
+    add.s64 %rd9, %rd7, %rd8;
+    ld.global.u8 %r18, [%rd9];
+
+    // qh index
+    shl.b32 %r19, %r10, 5;
+    add.u32 %r19, %r19, %r13;
+    cvt.u64.u32 %rd10, %r19;
+    add.s64 %rd11, %rd7, 128;
+    add.s64 %rd12, %rd11, %rd10;
+    ld.global.u8 %r20, [%rd12];
+
+    setp.ge.u32 %p5, %r12, 2;
+    @%p5 shr.u32 %r21, %r18, 4;
+    @!%p5 and.b32 %r21, %r18, 15;
+    and.b32 %r21, %r21, 15;
+
+    shl.b32 %r22, %r12, 1;
+    shr.u32 %r23, %r20, %r22;
+    and.b32 %r23, %r23, 3;
+    shl.b32 %r23, %r23, 4;
+    or.b32 %r24, %r21, %r23;
+    sub.s32 %r24, %r24, 32;
+
+    // scale index half*8 + quarter*2 + is
+    shl.b32 %r25, %r10, 3;
+    shl.b32 %r26, %r12, 1;
+    add.u32 %r25, %r25, %r26;
+    add.u32 %r25, %r25, %r14;
+    cvt.u64.u32 %rd13, %r25;
+    add.s64 %rd14, %rd7, 192;
+    add.s64 %rd15, %rd14, %rd13;
+    ld.global.s8 %r27, [%rd15];
+
+    ld.global.b16 %r28, [%rd7+208];
+    cvt.f32.f16 %f1, %r28;
+    cvt.rn.f32.s32 %f2, %r27;
+    cvt.rn.f32.s32 %f3, %r24;
+    mul.rn.f32 %f4, %f1, %f2;
+    mul.rn.f32 %f5, %f4, %f3;
+
+    shl.b32 %r29, %r7, 8;
+    add.u32 %r29, %r29, %r9;
+    mul.wide.u32 %rd16, %r29, 4;
+    add.s64 %rd17, %rd2, %rd16;
+    ld.global.f32 %f6, [%rd17];
+
+    fma.rn.f32 %f10, %f5, %f6, %f10;
+
+    add.u32 %r8, %r8, 1;
+    bra Q6S_J_LOOP;
+
+Q6S_J_DONE:
+    add.u32 %r7, %r7, 1;
+    bra Q6S_BLOCK_LOOP;
+
+Q6S_BLOCKS_DONE:
+    mov.b32 %r40, %f10;
+    shfl.sync.down.b32 %r41, %r40, 16, 31, 0xffffffff;
+    mov.b32 %f11, %r41;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r40, %f10;
+    shfl.sync.down.b32 %r41, %r40, 8, 31, 0xffffffff;
+    mov.b32 %f11, %r41;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r40, %f10;
+    shfl.sync.down.b32 %r41, %r40, 4, 31, 0xffffffff;
+    mov.b32 %f11, %r41;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r40, %f10;
+    shfl.sync.down.b32 %r41, %r40, 2, 31, 0xffffffff;
+    mov.b32 %f11, %r41;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r40, %f10;
+    shfl.sync.down.b32 %r41, %r40, 1, 31, 0xffffffff;
+    mov.b32 %f11, %r41;
+    add.rn.f32 %f10, %f10, %f11;
+
+    setp.ne.u32 %p6, %r4, 0;
+    @%p6 bra Q6S_DONE;
+
+    mul.wide.u32 %rd18, %r3, 4;
+    add.s64 %rd19, %rd3, %rd18;
+    st.global.f32 [%rd19], %f10;
+
+Q6S_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ6KGemvPtx = R"ptx(
 .version 7.1
 .target sm_86
