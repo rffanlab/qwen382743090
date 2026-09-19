@@ -51,7 +51,7 @@ static const char* support_name(const q38::TensorRecord& t) {
     }
     if (t.ggml_type == 12 && t.layout == q38::TensorLayout::GgufNative) return "Q4K_NATIVE_READY";
     if (t.ggml_type == 14) return "NEED_Q6K_GEMV";
-    if (t.ggml_type == 23 && t.layout == q38::TensorLayout::GgufNative) return "IQ4XS_NATIVE_READY_OCCUPANCY_TUNING";
+    if (t.ggml_type == 23 && t.layout == q38::TensorLayout::GgufNative) return "IQ4XS_NATIVE_READY_PRMT_TUNING";
     if (t.ggml_type == 8) return "NEED_Q8_0_GEMV";
     return "NEED_KERNEL";
 }
