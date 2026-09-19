@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a GGUF checkpoint into Q38PACK v1.
-
-V1 is deliberately conservative: quantized tensor payloads are copied
-byte-for-byte. The conversion changes container layout, not model numerics.
-Later SM86-specific repackers can add alternate tensor layouts while retaining
-this source-preserving path as the correctness oracle.
-"""
+"""Convert GGUF into Q38PACK v1 or RTX-3090-specialized Q38PACK v2."""
 
 from __future__ import annotations
 
@@ -13,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -24,10 +19,19 @@ from q38pack_format import (  # noqa: E402
     DEFAULT_ALIGNMENT,
     ENTRY_BYTES,
     HEADER_BYTES,
+    LAYOUT_GGUF_NATIVE,
+    LAYOUT_SM86_Q5K_SOA,
     PackHeader,
     TensorEntry,
     align_up,
 )
+
+GGML_TYPE_Q5_K = 13
+QK_K = 256
+Q5_K_BYTES = 176
+SM86_META_BYTES = 20
+SM86_QH_BYTES = 32
+SM86_QS_BYTES = 128
 
 GGUF_TYPES = {
     0: ("uint8", "<B"),
@@ -139,7 +143,7 @@ def parse_gguf(path: Path) -> GGUFInfo:
             name = r.string()
             ndim = r.u32()
             if ndim > 4:
-                raise ValueError(f"tensor {name!r} has {ndim} dimensions; Q38PACK v1 supports <= 4")
+                raise ValueError(f"tensor {name!r} has {ndim} dimensions; Q38PACK supports <= 4")
             dims = tuple(r.u64() for _ in range(ndim))
             ggml_type = r.u32()
             offset = r.u64()
@@ -199,15 +203,13 @@ def selected_metadata(meta: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def copy_exact(src: BinaryIO, dst: BinaryIO, count: int, hasher=None, chunk_size: int = 16 << 20) -> None:
+def copy_exact(src: BinaryIO, dst: BinaryIO, count: int, chunk_size: int = 16 << 20) -> None:
     remaining = count
     while remaining:
         chunk = src.read(min(chunk_size, remaining))
         if not chunk:
             raise ValueError("unexpected EOF while copying tensor payload")
         dst.write(chunk)
-        if hasher is not None:
-            hasher.update(chunk)
         remaining -= len(chunk)
 
 
@@ -219,16 +221,101 @@ def pad_to(fp: BinaryIO, offset: int) -> None:
         fp.write(bytes(offset - here))
 
 
-def convert(source: Path, destination: Path, alignment: int, with_sha256: bool) -> dict[str, Any]:
+def q5_block_count(tensor: GGUFTensor) -> int:
+    elements = math.prod(tensor.dims)
+    if elements % QK_K:
+        raise ValueError(f"Q5_K tensor {tensor.name!r} has element count not divisible by 256")
+    blocks = elements // QK_K
+    expected = blocks * Q5_K_BYTES
+    if expected > tensor.stored_bytes:
+        raise ValueError(
+            f"Q5_K tensor {tensor.name!r} needs {expected} bytes but GGUF span has {tensor.stored_bytes}"
+        )
+    return blocks
+
+
+def sm86_q5_layout(start: int, blocks: int) -> tuple[int, int, int, int]:
+    meta = start
+    qh = align_up(meta + blocks * SM86_META_BYTES, 128)
+    qs = align_up(qh + blocks * SM86_QH_BYTES, 128)
+    end = qs + blocks * SM86_QS_BYTES
+    return meta, qh, qs, end
+
+
+def require_numpy():
+    try:
+        import numpy as np  # type: ignore
+        return np
+    except ImportError as exc:
+        raise RuntimeError(
+            "Q38PACK v2 SM86 Q5_K repack requires NumPy. "
+            "Install it with: python3 -m pip install numpy ; "
+            "or use --format-version 1."
+        ) from exc
+
+
+def repack_q5_sm86(
+    src: BinaryIO,
+    dst: BinaryIO,
+    source_offset: int,
+    blocks: int,
+    meta_offset: int,
+    qh_offset: int,
+    qs_offset: int,
+    chunk_blocks: int = 65536,
+) -> None:
+    np = require_numpy()
+
+    for block0 in range(0, blocks, chunk_blocks):
+        n = min(chunk_blocks, blocks - block0)
+        src.seek(source_offset + block0 * Q5_K_BYTES)
+        raw = src.read(n * Q5_K_BYTES)
+        if len(raw) != n * Q5_K_BYTES:
+            raise ValueError("unexpected EOF while reading Q5_K tensor")
+
+        a = np.frombuffer(raw, dtype=np.uint8).reshape(n, Q5_K_BYTES)
+        meta = np.empty((n, SM86_META_BYTES), dtype=np.uint8)
+        meta[:, 0:4] = a[:, 0:4]
+        s = a[:, 4:16]
+
+        for g in range(8):
+            if g < 4:
+                sc = s[:, g] & 63
+                mn = s[:, g + 4] & 63
+            else:
+                sc = (s[:, g + 4] & 15) | ((s[:, g - 4] >> 6) << 4)
+                mn = (s[:, g + 4] >> 4) | ((s[:, g] >> 6) << 4)
+            meta[:, 4 + 2 * g] = sc
+            meta[:, 5 + 2 * g] = mn
+
+        dst.seek(meta_offset + block0 * SM86_META_BYTES)
+        dst.write(meta.tobytes(order="C"))
+        dst.seek(qh_offset + block0 * SM86_QH_BYTES)
+        dst.write(a[:, 16:48].tobytes(order="C"))
+        dst.seek(qs_offset + block0 * SM86_QS_BYTES)
+        dst.write(a[:, 48:176].tobytes(order="C"))
+
+
+def convert(
+    source: Path,
+    destination: Path,
+    alignment: int,
+    with_sha256: bool,
+    pack_version: int = 2,
+) -> dict[str, Any]:
+    if pack_version not in (1, 2):
+        raise ValueError("pack_version must be 1 or 2")
     info = parse_gguf(source)
     if alignment < 256 or alignment & (alignment - 1):
         raise ValueError("--alignment must be a power of two >= 256")
 
     arch = info.metadata.get("general.architecture")
+    specialized_q5 = sum(1 for t in info.tensors if pack_version >= 2 and t.ggml_type == GGML_TYPE_Q5_K)
+
     manifest: dict[str, Any] = {
         "format": "q38pack",
-        "version": 1,
-        "layout": "gguf-native-v1",
+        "version": pack_version,
+        "layout": "sm86-v2" if pack_version >= 2 else "gguf-native-v1",
         "target": {"model": "Qwen3.8-27B", "gpu": "RTX 3090", "sm": 86},
         "source": {
             "filename": source.name,
@@ -242,10 +329,17 @@ def convert(source: Path, destination: Path, alignment: int, with_sha256: bool) 
             "name": info.metadata.get("general.name"),
             "tensor_count": info.tensor_count,
         },
+        "specialized_layouts": {
+            "sm86_q5k_soa_tensors": specialized_q5,
+        },
         "metadata": selected_metadata(info.metadata),
         "notes": [
-            "Tensor payloads are copied byte-for-byte from GGUF in Q38PACK v1.",
             "raw_gguf_meta preserves the original GGUF header/metadata/tensor directory.",
+            (
+                "Q5_K tensors are repacked losslessly to META20/QH32/QS128 SoA for SM86."
+                if pack_version >= 2
+                else "Tensor payloads are copied byte-for-byte from GGUF in Q38PACK v1."
+            ),
         ],
     }
 
@@ -278,28 +372,51 @@ def convert(source: Path, destination: Path, alignment: int, with_sha256: bool) 
     for t in info.tensors:
         cursor = align_up(cursor, alignment)
         dims = tuple(t.dims) + (0,) * (4 - len(t.dims))
-        output_entries.append(
-            TensorEntry(
-                name=t.name,
-                ndim=len(t.dims),
-                ggml_type=t.ggml_type,
-                dims=dims,
-                data_offset=cursor,
-                stored_bytes=t.stored_bytes,
-                source_offset=info.data_offset + t.offset,
-                role=tensor_role(t.name),
-            )
-        )
-        cursor += t.stored_bytes
-    data_end = cursor
 
+        if pack_version >= 2 and t.ggml_type == GGML_TYPE_Q5_K:
+            blocks = q5_block_count(t)
+            meta, qh, qs, end = sm86_q5_layout(cursor, blocks)
+            output_entries.append(
+                TensorEntry(
+                    name=t.name,
+                    ndim=len(t.dims),
+                    ggml_type=t.ggml_type,
+                    dims=dims,
+                    data_offset=meta,
+                    stored_bytes=end - meta,
+                    source_offset=info.data_offset + t.offset,
+                    role=tensor_role(t.name),
+                    layout=LAYOUT_SM86_Q5K_SOA,
+                    aux0_offset=qh,
+                    aux1_offset=qs,
+                )
+            )
+            cursor = end
+        else:
+            output_entries.append(
+                TensorEntry(
+                    name=t.name,
+                    ndim=len(t.dims),
+                    ggml_type=t.ggml_type,
+                    dims=dims,
+                    data_offset=cursor,
+                    stored_bytes=t.stored_bytes,
+                    source_offset=info.data_offset + t.offset,
+                    role=tensor_role(t.name),
+                    layout=LAYOUT_GGUF_NATIVE,
+                )
+            )
+            cursor += t.stored_bytes
+
+    data_end = cursor
     destination.parent.mkdir(parents=True, exist_ok=True)
     tmp = destination.with_suffix(destination.suffix + ".tmp")
+
     with source.open("rb") as src, tmp.open("wb+") as dst:
         dst.write(bytes(HEADER_BYTES))
         pad_to(dst, directory_offset)
         for entry in output_entries:
-            dst.write(entry.encode())
+            dst.write(entry.encode(pack_version))
         pad_to(dst, manifest_offset)
         dst.write(manifest_bytes)
         pad_to(dst, raw_meta_offset)
@@ -310,14 +427,35 @@ def convert(source: Path, destination: Path, alignment: int, with_sha256: bool) 
             raise ValueError("failed to read original GGUF metadata region")
         dst.write(raw_meta)
 
+        q5_done = 0
         for source_tensor, output_entry in zip(info.tensors, output_entries):
-            pad_to(dst, output_entry.data_offset)
-            src.seek(info.data_offset + source_tensor.offset)
-            copy_exact(src, dst, source_tensor.stored_bytes)
+            if output_entry.layout == LAYOUT_SM86_Q5K_SOA:
+                q5_done += 1
+                if q5_done == 1 or q5_done % 32 == 0 or q5_done == specialized_q5:
+                    print(
+                        f"repacking SM86 Q5_K tensors: {q5_done}/{specialized_q5}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                blocks = q5_block_count(source_tensor)
+                repack_q5_sm86(
+                    src,
+                    dst,
+                    info.data_offset + source_tensor.offset,
+                    blocks,
+                    output_entry.data_offset,
+                    output_entry.aux0_offset,
+                    output_entry.aux1_offset,
+                )
+            else:
+                dst.seek(output_entry.data_offset)
+                src.seek(info.data_offset + source_tensor.offset)
+                copy_exact(src, dst, source_tensor.stored_bytes)
 
         pad_to(dst, data_end)
 
         header = PackHeader(
+            version=pack_version,
             flags=1,
             tensor_count=info.tensor_count,
             alignment=alignment,
@@ -342,17 +480,28 @@ def convert(source: Path, destination: Path, alignment: int, with_sha256: bool) 
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Convert GGUF to Q38PACK v1")
+    ap = argparse.ArgumentParser(description="Convert GGUF to Q38PACK")
     ap.add_argument("source", type=Path, help="input .gguf")
     ap.add_argument("destination", type=Path, help="output .q38pack")
-    ap.add_argument("--alignment", type=int, default=DEFAULT_ALIGNMENT, help="tensor alignment (default: 4096)")
-    ap.add_argument("--sha256", action="store_true", help="also compute the source GGUF SHA-256 (extra full read)")
+    ap.add_argument("--format-version", type=int, choices=(1, 2), default=2,
+                    help="Q38PACK version (default: 2 / SM86-specialized Q5_K)")
+    ap.add_argument("--alignment", type=int, default=DEFAULT_ALIGNMENT,
+                    help="tensor alignment (default: 4096)")
+    ap.add_argument("--sha256", action="store_true",
+                    help="also compute the source GGUF SHA-256 (extra full read)")
     args = ap.parse_args()
 
-    manifest = convert(args.source, args.destination, args.alignment, args.sha256)
+    manifest = convert(
+        args.source, args.destination, args.alignment, args.sha256, args.format_version
+    )
     print(f"wrote {args.destination}")
+    print(f"q38pack_version: {manifest['version']}")
     print(f"architecture: {manifest['model'].get('architecture')}")
     print(f"tensors: {manifest['model']['tensor_count']}")
+    print(
+        "sm86_q5k_soa_tensors: "
+        f"{manifest['specialized_layouts']['sm86_q5k_soa_tensors']}"
+    )
     return 0
 
 
