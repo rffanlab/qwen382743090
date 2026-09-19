@@ -1298,11 +1298,18 @@ Q6_BLOCK_LOOP:
     add.u32 %r17, %r17, %r22;
     add.u32 %r17, %r17, %r19;
 
-    // ql: 8 bytes.
+    // ql: 8 bytes. Q6_K blocks are 210 bytes, so odd blocks are only
+    // 2-byte aligned. Use b16 loads and assemble b32 values in registers.
     cvt.u64.u32 %rd8, %r17;
     add.s64 %rd9, %rd7, %rd8;
-    ld.global.b32 %r40, [%rd9+0];
-    ld.global.b32 %r41, [%rd9+4];
+    ld.global.b16 %r40, [%rd9+0];
+    ld.global.b16 %r41, [%rd9+2];
+    ld.global.b16 %r42, [%rd9+4];
+    ld.global.b16 %r43, [%rd9+6];
+    shl.b32 %r84, %r41, 16;
+    or.b32 %r40, %r40, %r84;
+    shl.b32 %r84, %r43, 16;
+    or.b32 %r41, %r42, %r84;
 
     // qh: half*32 + sublane*8 + group-local 16 offset.
     shl.b32 %r20, %r13, 5;
@@ -1312,8 +1319,14 @@ Q6_BLOCK_LOOP:
     cvt.u64.u32 %rd10, %r20;
     add.s64 %rd11, %rd7, 128;
     add.s64 %rd12, %rd11, %rd10;
-    ld.global.b32 %r42, [%rd12+0];
-    ld.global.b32 %r43, [%rd12+4];
+    ld.global.b16 %r42, [%rd12+0];
+    ld.global.b16 %r43, [%rd12+2];
+    ld.global.b16 %r85, [%rd12+4];
+    ld.global.b16 %r86, [%rd12+6];
+    shl.b32 %r84, %r43, 16;
+    or.b32 %r42, %r42, %r84;
+    shl.b32 %r84, %r86, 16;
+    or.b32 %r43, %r85, %r84;
 
     // nibble select: groups 4..7 use ql high nibble.
     setp.ge.u32 %p3, %r14, 4;
