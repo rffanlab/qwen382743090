@@ -4780,6 +4780,212 @@ bool NvidiaDriver::run_q4k_gemv_smoke(
 
 
 
+
+bool NvidiaDriver::run_q6k_dequant_smoke(
+    const std::byte* block,
+    std::string* error,
+    double* max_abs_error,
+    double* max_rel_error,
+    std::uint32_t* first_bad_index) {
+    try {
+        if (!available()) {
+            throw std::runtime_error("driver is not initialized");
+        }
+        if (!is_sm86()) {
+            throw std::runtime_error(
+                "q38 Q6_K dequant smoke requires sm_86; detected sm_" +
+                std::to_string(sm_major_) +
+                std::to_string(sm_minor_));
+        }
+        if (!block) {
+            throw std::invalid_argument("Q6_K block is null");
+        }
+
+        std::array<float, kQ4KValuesPerBlock> ref{};
+        std::array<float, kQ4KValuesPerBlock> gpu{};
+        dequantize_q6_k_block_cpu(block, ref);
+
+        constexpr std::size_t block_off = 0;
+        constexpr std::size_t out_off = 256;
+        const std::size_t total_bytes =
+            out_off + gpu.size() * sizeof(float);
+        ScopedVmm memory(
+            handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD =
+            CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH =
+            CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using ModuleLoadDataEx =
+            CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction =
+            CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel =
+            CUresult(*)(CUfunction,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod =
+            sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh =
+            sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto module_load_ex =
+            sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload =
+            sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function =
+            sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch =
+            sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync =
+            sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        const CUdeviceptr block_ptr =
+            memory.ptr() + block_off;
+        const CUdeviceptr out_ptr =
+            memory.ptr() + out_off;
+
+        check(handle_, memcpy_htod(
+            block_ptr, block, kQ6KBytesPerBlock),
+            "cuMemcpyHtoD(Q6_K dequant block)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto rc = module_load_ex(
+            &module,
+            kQ6KDequantPtx,
+            static_cast<unsigned int>(
+                sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (rc != CUDA_SUCCESS) {
+            std::string detail =
+                cuda_error(
+                    handle_, rc,
+                    "cuModuleLoadDataEx(Q6_K dequant)");
+            if (jit_error[0] != '\0') {
+                detail +=
+                    std::string("\nPTX JIT error log:\n") +
+                    jit_error.data();
+            }
+            if (jit_info[0] != '\0') {
+                detail +=
+                    std::string("\nPTX JIT info log:\n") +
+                    jit_info.data();
+            }
+            throw std::runtime_error(detail);
+        }
+
+        try {
+            CUfunction fn{};
+            check(handle_, module_get_function(
+                &fn, module, "q38_dequant_q6k_block"),
+                "cuModuleGetFunction(q38_dequant_q6k_block)");
+
+            CUdeviceptr arg_block = block_ptr;
+            CUdeviceptr arg_out = out_ptr;
+            void* params[] = {
+                &arg_block, &arg_out
+            };
+
+            check(handle_, launch(
+                fn,
+                1, 1, 1,
+                256, 1, 1,
+                0, nullptr, params, nullptr),
+                "cuLaunchKernel(q38_dequant_q6k_block)");
+            check(handle_, sync(),
+                  "cuCtxSynchronize(Q6_K dequant)");
+            check(handle_, memcpy_dtoh(
+                gpu.data(),
+                out_ptr,
+                gpu.size() * sizeof(float)),
+                "cuMemcpyDtoH(Q6_K dequant)");
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+
+        check(handle_, module_unload(module),
+              "cuModuleUnload(Q6_K dequant)");
+
+        double abs_max = 0.0;
+        double rel_max = 0.0;
+        std::uint32_t bad_index =
+            static_cast<std::uint32_t>(gpu.size());
+
+        for (std::size_t i = 0; i < gpu.size(); ++i) {
+            const double got =
+                static_cast<double>(gpu[i]);
+            const double expected =
+                static_cast<double>(ref[i]);
+            const double abs_err =
+                std::abs(got - expected);
+            const double rel_err =
+                abs_err /
+                std::max(1.0e-6, std::abs(expected));
+
+            abs_max = std::max(abs_max, abs_err);
+            rel_max = std::max(rel_max, rel_err);
+
+            if (bad_index == gpu.size() &&
+                (abs_err > 1.0e-5 &&
+                 rel_err > 1.0e-5)) {
+                bad_index =
+                    static_cast<std::uint32_t>(i);
+            }
+        }
+
+        if (max_abs_error) *max_abs_error = abs_max;
+        if (max_rel_error) *max_rel_error = rel_max;
+        if (first_bad_index) *first_bad_index = bad_index;
+
+        if (bad_index != gpu.size()) {
+            std::ostringstream oss;
+            oss << "Q6_K dequant mismatch: first_bad="
+                << bad_index
+                << " gpu=" << gpu[bad_index]
+                << " cpu=" << ref[bad_index]
+                << " max_abs=" << abs_max
+                << " max_rel=" << rel_max;
+            throw std::runtime_error(oss.str());
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 bool NvidiaDriver::run_q6k_gemv_smoke(
     const std::byte* matrix,
     std::uint32_t cols,
