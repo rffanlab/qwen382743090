@@ -323,6 +323,235 @@ APPLY_DONE:
 }
 )ptx";
 
+constexpr const char* kQwen35RecurrentPrepPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_qwen35_conv4_silu_update(
+    .param .u64 p_qkv,
+    .param .u64 p_weight,
+    .param .u64 p_state_in,
+    .param .u64 p_conv_out,
+    .param .u64 p_state_out,
+    .param .u32 p_channels,
+    .param .f32 p_log2e
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<20>;
+
+    ld.param.u64 %rd1, [p_qkv];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_state_in];
+    ld.param.u64 %rd4, [p_conv_out];
+    ld.param.u64 %rd5, [p_state_out];
+    ld.param.u32 %r1, [p_channels];
+    ld.param.f32 %f1, [p_log2e];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra C4_DONE;
+
+    mul.wide.u32 %rd6, %r5, 4;
+    add.s64 %rd7, %rd1, %rd6;
+    ld.global.f32 %f2, [%rd7];
+
+    mul.lo.u32 %r6, %r5, 3;
+    mul.wide.u32 %rd8, %r6, 4;
+    add.s64 %rd9, %rd3, %rd8;
+    add.s64 %rd10, %rd5, %rd8;
+    ld.global.f32 %f3, [%rd9+0];
+    ld.global.f32 %f4, [%rd9+4];
+    ld.global.f32 %f5, [%rd9+8];
+
+    shl.b32 %r7, %r5, 2;
+    mul.wide.u32 %rd11, %r7, 4;
+    add.s64 %rd12, %rd2, %rd11;
+    ld.global.v4.f32 {%f6,%f7,%f8,%f9}, [%rd12];
+
+    mul.rn.f32 %f10, %f3, %f6;
+    fma.rn.f32 %f10, %f4, %f7, %f10;
+    fma.rn.f32 %f10, %f5, %f8, %f10;
+    fma.rn.f32 %f10, %f2, %f9, %f10;
+
+    // SiLU(x) = x / (1 + exp(-x)).
+    neg.f32 %f11, %f10;
+    mul.rn.f32 %f11, %f11, %f1;
+    ex2.approx.f32 %f12, %f11;
+    add.rn.f32 %f13, %f12, 0f3f800000;
+    div.rn.f32 %f14, %f10, %f13;
+
+    add.s64 %rd13, %rd4, %rd6;
+    st.global.f32 [%rd13], %f14;
+
+    // Shift decode-time conv state: [s0,s1,s2] -> [s1,s2,current].
+    st.global.f32 [%rd10+0], %f4;
+    st.global.f32 [%rd10+4], %f5;
+    st.global.f32 [%rd10+8], %f2;
+
+C4_DONE:
+    ret;
+}
+
+.visible .entry q38_qwen35_qk_sumsq(
+    .param .u64 p_conv,
+    .param .u64 p_sums,
+    .param .u32 p_count
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<10>;
+    .reg .f32 %f<6>;
+
+    ld.param.u64 %rd1, [p_conv];
+    ld.param.u64 %rd2, [p_sums];
+    ld.param.u32 %r1, [p_count];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra QKS_DONE;
+
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    mul.rn.f32 %f2, %f1, %f1;
+
+    shr.u32 %r6, %r5, 7;
+    mul.wide.u32 %rd5, %r6, 4;
+    add.s64 %rd6, %rd2, %rd5;
+    atom.global.add.f32 %f3, [%rd6], %f2;
+
+QKS_DONE:
+    ret;
+}
+
+.visible .entry q38_qwen35_qk_norm(
+    .param .u64 p_conv,
+    .param .u64 p_sums,
+    .param .u64 p_qk_out,
+    .param .u32 p_count,
+    .param .f32 p_eps
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<10>;
+
+    ld.param.u64 %rd1, [p_conv];
+    ld.param.u64 %rd2, [p_sums];
+    ld.param.u64 %rd3, [p_qk_out];
+    ld.param.u32 %r1, [p_count];
+    ld.param.f32 %f1, [p_eps];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra QKN_DONE;
+
+    shr.u32 %r6, %r5, 7;
+    mul.wide.u32 %rd4, %r6, 4;
+    add.s64 %rd5, %rd2, %rd4;
+    ld.global.f32 %f2, [%rd5];
+    add.rn.f32 %f3, %f2, %f1;
+    rsqrt.approx.f32 %f4, %f3;
+
+    mul.wide.u32 %rd6, %r5, 4;
+    add.s64 %rd7, %rd1, %rd6;
+    add.s64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f5, [%rd7];
+    mul.rn.f32 %f6, %f5, %f4;
+    st.global.f32 [%rd8], %f6;
+
+QKN_DONE:
+    ret;
+}
+
+.visible .entry q38_qwen35_gate_beta(
+    .param .u64 p_beta_raw,
+    .param .u64 p_alpha_raw,
+    .param .u64 p_dt,
+    .param .u64 p_a,
+    .param .u64 p_beta_out,
+    .param .u64 p_gate_out,
+    .param .u32 p_heads,
+    .param .f32 p_log2e,
+    .param .f32 p_ln2
+)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<24>;
+
+    ld.param.u64 %rd1, [p_beta_raw];
+    ld.param.u64 %rd2, [p_alpha_raw];
+    ld.param.u64 %rd3, [p_dt];
+    ld.param.u64 %rd4, [p_a];
+    ld.param.u64 %rd5, [p_beta_out];
+    ld.param.u64 %rd6, [p_gate_out];
+    ld.param.u32 %r1, [p_heads];
+    ld.param.f32 %f1, [p_log2e];
+    ld.param.f32 %f2, [p_ln2];
+
+    mov.u32 %r2, %tid.x;
+    setp.ge.u32 %p1, %r2, %r1;
+    @%p1 bra GB_DONE;
+
+    mul.wide.u32 %rd7, %r2, 4;
+    add.s64 %rd8, %rd1, %rd7;
+    add.s64 %rd9, %rd2, %rd7;
+    add.s64 %rd10, %rd3, %rd7;
+    add.s64 %rd11, %rd4, %rd7;
+    add.s64 %rd12, %rd5, %rd7;
+    add.s64 %rd13, %rd6, %rd7;
+
+    ld.global.f32 %f3, [%rd8];
+    ld.global.f32 %f4, [%rd9];
+    ld.global.f32 %f5, [%rd10];
+    ld.global.f32 %f6, [%rd11];
+
+    // sigmoid(beta_raw)
+    neg.f32 %f7, %f3;
+    mul.rn.f32 %f7, %f7, %f1;
+    ex2.approx.f32 %f8, %f7;
+    add.rn.f32 %f9, %f8, 0f3f800000;
+    rcp.approx.f32 %f10, %f9;
+    st.global.f32 [%rd12], %f10;
+
+    // softplus(alpha + dt), stable for large positive values.
+    add.rn.f32 %f11, %f4, %f5;
+    setp.gt.f32 %p2, %f11, 0f41a00000; // 20.0
+    @%p2 mov.f32 %f16, %f11;
+    @%p2 bra GB_SOFTPLUS_READY;
+
+    mul.rn.f32 %f12, %f11, %f1;
+    ex2.approx.f32 %f13, %f12;
+    add.rn.f32 %f14, %f13, 0f3f800000;
+    lg2.approx.f32 %f15, %f14;
+    mul.rn.f32 %f16, %f15, %f2;
+
+GB_SOFTPLUS_READY:
+    mul.rn.f32 %f17, %f16, %f6;
+    st.global.f32 [%rd13], %f17;
+
+GB_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kGdnAr128Ptx = R"ptx(
 .version 7.1
 .target sm_86
