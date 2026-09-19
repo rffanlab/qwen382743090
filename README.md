@@ -893,3 +893,71 @@ This target uses deterministic synthetic projection outputs and conv state, but
 real model conv/dt/a tensors. It validates the complete conv output, normalized
 Q/K, beta/gate values and rolled conv state against independent CPU math before
 the stage is embedded into the shared layer0 Runtime workspace.
+
+
+### Recurrent prep result
+
+The real-model recurrent preprocessing path is validated on RTX 3090:
+
+    conv_silu_ms:             0.0022
+    qk_norm_ms:               0.0022
+    beta_gate_ms:             0.0019
+    recurrent_prep_chain_ms:  0.0067
+
+Full-array correctness:
+
+    conv_max_abs_error:       7.450581e-09
+    q_max_abs_error:          8.940697e-08
+    k_max_abs_error:          5.960464e-08
+    beta_max_abs_error:       5.960464e-08
+    gate_max_abs_error:       2.384186e-07
+    conv_state_max_abs_error: 0
+
+The fused single-token GDN core separately measures:
+
+    kernel_ms: 0.0061
+    state_read_write_bandwidth_GBps: 1024.7322
+
+### Integrated layer0 recurrent front
+
+The runtime now combines the validated stages in one VMM workspace and one
+ordered CUDA Driver stream:
+
+    hidden[5120]
+      -> RMSNorm
+      -> qkv[10240] / z[6144] / beta[48] / alpha[48]
+      -> conv4 + SiLU + conv-state roll
+      -> Q/K per-head L2 normalization
+      -> beta sigmoid
+      -> gate = softplus(alpha + dt) * ssm_a
+      -> fused single-token Gated DeltaNet
+      -> GDN output[6144] + updated state[48,128,128]
+
+The z projection is retained in the workspace for the next gated-normalization
+stage even though the current endpoint stops at the raw GDN output.
+
+Projection kernels use the Runtime dispatcher:
+
+    qkv / z   -> Q5K_SM86_VEC
+    beta/alpha -> Q4K_NATIVE
+
+Correctness for the integrated test treats the already-validated projection
+kernels as upstream inputs, then independently recomputes the full downstream
+conv/prep/GDN path on CPU and compares:
+
+    conv[10240]
+    q[2048]
+    k[2048]
+    beta[48]
+    gate[48]
+    conv state[3,10240]
+    GDN output[6144]
+    GDN state[48,128,128]
+
+Run:
+
+    ./build/q38-layer0-recurrent-front --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+The benchmark reports projection-stage, recurrent-prep, GDN, sum-of-stage and
+true integrated-chain latency. Weight upload, model copies and PTX JIT are
+excluded from timing.
