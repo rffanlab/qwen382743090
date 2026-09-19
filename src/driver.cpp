@@ -1746,4 +1746,194 @@ bool NvidiaDriver::run_q5k_gemv_smoke(
     }
 }
 
+bool NvidiaDriver::run_q5k_q8k_gemv_smoke(
+    const std::byte* matrix,
+    std::uint32_t cols,
+    std::uint32_t rows,
+    std::string* error,
+    double* max_abs_error,
+    double* max_rel_error,
+    double* milliseconds,
+    double* bandwidth_gbps) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error("q38 Q5_K x Q8_K GEMV requires sm_86; detected sm_" +
+                                     std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (!matrix) throw std::invalid_argument("Q5_K matrix is null");
+        if (cols == 0 || rows == 0 || (cols % kQ4KValuesPerBlock) != 0) {
+            throw std::invalid_argument("Q5_K x Q8_K GEMV requires non-zero rows and cols divisible by 256");
+        }
+
+        const std::size_t blocks_per_row = cols / kQ4KValuesPerBlock;
+        const std::size_t matrix_bytes =
+            static_cast<std::size_t>(rows) * blocks_per_row * kQ5KBytesPerBlock;
+        const std::size_t q8_bytes = blocks_per_row * kQ8KBytesPerBlock;
+        const std::size_t y_bytes = static_cast<std::size_t>(rows) * sizeof(float);
+
+        std::vector<float> x(cols);
+        for (std::uint32_t i = 0; i < cols; ++i) {
+            const float fi = static_cast<float>(i);
+            x[i] = std::sin(fi * 0.017f) * 0.65f + std::cos(fi * 0.011f) * 0.35f;
+        }
+        const auto q8 = quantize_q8_k_cpu(x.data(), x.size());
+
+        auto align256 = [](std::size_t v) { return (v + 255u) & ~std::size_t(255u); };
+        const std::size_t matrix_off = 0;
+        const std::size_t q8_off = align256(matrix_bytes);
+        const std::size_t y_off = align256(q8_off + q8_bytes);
+        const std::size_t total_bytes = y_off + y_bytes;
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD = CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH = CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using MemsetD32 = CUresult(*)(CUdeviceptr, unsigned int, std::size_t);
+        using ModuleLoadDataEx = CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction = CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel = CUresult(*)(CUfunction,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod = sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh = sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto memset_d32 = sym<MemsetD32>(handle_, "cuMemsetD32_v2");
+        const auto module_load_ex = sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload = sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function = sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch = sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync = sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        std::vector<float> y(rows);
+        const CUdeviceptr matrix_ptr = memory.ptr() + matrix_off;
+        const CUdeviceptr q8_ptr = memory.ptr() + q8_off;
+        const CUdeviceptr y_ptr = memory.ptr() + y_off;
+
+        check(handle_, memcpy_htod(matrix_ptr, matrix, matrix_bytes), "cuMemcpyHtoD(Q5_K matrix)");
+        check(handle_, memcpy_htod(q8_ptr, q8.data(), q8_bytes), "cuMemcpyHtoD(Q8_K activation)");
+        check(handle_, memset_d32(y_ptr, 0, rows), "cuMemsetD32(Q5_K x Q8_K y)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto module_rc = module_load_ex(
+            &module,
+            kQ5KQ8KGemvPtx,
+            static_cast<unsigned int>(sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (module_rc != CUDA_SUCCESS) {
+            std::string detail = cuda_error(handle_, module_rc, "cuModuleLoadDataEx(Q5_K x Q8_K GEMV)");
+            if (jit_error[0] != '\0') detail += std::string("\nPTX JIT error log:\n") + jit_error.data();
+            if (jit_info[0] != '\0') detail += std::string("\nPTX JIT info log:\n") + jit_info.data();
+            throw std::runtime_error(detail);
+        }
+
+        CUfunction fn{};
+        try {
+            check(handle_, module_get_function(&fn, module, "q38_q5k_q8k_gemv"),
+                  "cuModuleGetFunction(q38_q5k_q8k_gemv)");
+
+            CUdeviceptr arg_w = matrix_ptr;
+            CUdeviceptr arg_q8 = q8_ptr;
+            CUdeviceptr arg_y = y_ptr;
+            std::uint32_t arg_cols = cols;
+            std::uint32_t arg_rows = rows;
+            void* params[] = {&arg_w, &arg_q8, &arg_y, &arg_cols, &arg_rows};
+
+            check(handle_, launch(fn, rows, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr),
+                  "cuLaunchKernel(q38_q5k_q8k_gemv)");
+            check(handle_, sync(), "cuCtxSynchronize(Q5_K x Q8_K correctness)");
+            check(handle_, memcpy_dtoh(y.data(), y_ptr, y_bytes), "cuMemcpyDtoH(Q5_K x Q8_K)");
+
+            const std::size_t checked_rows = std::min<std::size_t>(rows, 8);
+            std::array<float, kQ4KValuesPerBlock> w_deq{};
+            std::array<float, kQ4KValuesPerBlock> x_deq{};
+            double abs_max = 0.0;
+            double rel_max = 0.0;
+            for (std::size_t row = 0; row < checked_rows; ++row) {
+                double ref = 0.0;
+                const auto* row_ptr =
+                    matrix + row * blocks_per_row * kQ5KBytesPerBlock;
+                for (std::size_t ib = 0; ib < blocks_per_row; ++ib) {
+                    dequantize_q5_k_block_cpu(
+                        row_ptr + ib * kQ5KBytesPerBlock, w_deq);
+                    dequantize_q8_k_block_cpu(
+                        q8.data() + ib * kQ8KBytesPerBlock, x_deq);
+                    for (std::size_t j = 0; j < kQ4KValuesPerBlock; ++j) {
+                        ref += static_cast<double>(w_deq[j]) *
+                               static_cast<double>(x_deq[j]);
+                    }
+                }
+                const double got = static_cast<double>(y[row]);
+                const double abs_err = std::abs(got - ref);
+                const double rel_err = abs_err / std::max(1.0e-5, std::abs(ref));
+                abs_max = std::max(abs_max, abs_err);
+                rel_max = std::max(rel_max, rel_err);
+            }
+            if (max_abs_error) *max_abs_error = abs_max;
+            if (max_rel_error) *max_rel_error = rel_max;
+            if (!(abs_max <= 2.0e-3 && rel_max <= 2.0e-3)) {
+                std::ostringstream oss;
+                oss << "Q5_K x Q8_K GEMV mismatch: max_abs=" << abs_max
+                    << " max_rel=" << rel_max;
+                throw std::runtime_error(oss.str());
+            }
+
+            // Clear once before timing. Atomic accumulation changes y across
+            // iterations but not the amount of kernel work or contention.
+            check(handle_, memset_d32(y_ptr, 0, rows), "cuMemsetD32(Q5_K x Q8_K benchmark)");
+            constexpr int kIters = 50;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kIters; ++i) {
+                check(handle_, launch(fn, rows, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr),
+                      "cuLaunchKernel(q38_q5k_q8k_gemv benchmark)");
+            }
+            check(handle_, sync(), "cuCtxSynchronize(Q5_K x Q8_K benchmark)");
+            const auto t1 = std::chrono::steady_clock::now();
+
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(t1 - t0).count() /
+                static_cast<double>(kIters);
+            const double gbps =
+                static_cast<double>(matrix_bytes) / (elapsed_ms / 1000.0) / 1.0e9;
+            if (milliseconds) *milliseconds = elapsed_ms;
+            if (bandwidth_gbps) *bandwidth_gbps = gbps;
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+
+        check(handle_, module_unload(module), "cuModuleUnload(Q5_K x Q8_K GEMV)");
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 } // namespace q38
