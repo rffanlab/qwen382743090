@@ -961,3 +961,62 @@ Run:
 The benchmark reports projection-stage, recurrent-prep, GDN, sum-of-stage and
 true integrated-chain latency. Weight upload, model copies and PTX JIT are
 excluded from timing.
+
+
+### Integrated recurrent attention branch
+
+The integrated recurrent front is validated on RTX 3090:
+
+    projection_stage_ms:       0.1468
+    recurrent_prep_stage_ms:   0.0063
+    gdn_stage_ms:              0.0060
+    sum_stage_ms:              0.1591
+    recurrent_front_chain_ms:  0.1621
+
+Correctness remains at roughly 1e-7 or better through conv/Q/K/beta/gate and
+about 1e-8 absolute error for the recurrent state update.
+
+The runtime now closes the full recurrent-attention branch by appending the
+exact Qwen35 gated-normalization tail:
+
+    GDN output[48,128]
+        -> RMSNorm per 128-d value head with blk.0.ssm_norm.weight[128]
+        -> multiply by SiLU(z[48,128])
+        -> blk.0.ssm_out.weight [6144,5120] through Q5K_SM86_VEC
+        -> add original hidden residual[5120]
+
+The tail uses:
+
+    q38_gated_rmsnorm_silu_128
+    q38_q5k_sm86_soa_gemv_vec
+    q38_add_residual_f32
+
+The full test shares one VMM workspace from the original hidden input through
+the final attention residual. Model upload and PTX JIT are excluded from
+timing.
+
+Run:
+
+    ./build/q38-layer0-recurrent-attention --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+It reports:
+
+    gated_norm_max_abs_error
+    ssm_out_max_abs_error
+    residual_max_abs_error
+    recurrent_front_ms
+    gated_norm_ms
+    ssm_out_ms
+    attention_tail_ms
+    sum_stage_ms
+    recurrent_attention_chain_ms
+
+Once this passes, the remaining work for a complete recurrent layer is the
+post-attention RMSNorm + dense FFN + final residual:
+
+    post_attention_norm
+        -> ffn_gate  IQ4_XS / IQ4XS_PRMT
+        -> ffn_up    Q5_K   / Q5K_SM86_VEC
+        -> SiLU(gate) * up
+        -> ffn_down  Q5_K   / Q5K_SM86_VEC
+        -> residual
