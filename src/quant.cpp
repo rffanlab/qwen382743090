@@ -246,6 +246,27 @@ std::vector<std::byte> quantize_q8_1_cpu(
     return out;
 }
 
+
+void dequantize_q8_1_block_cpu(
+    const std::byte* block,
+    std::array<float, kQ8_1ValuesPerBlock>& out) {
+    if (!block) throw std::invalid_argument("Q8_1 block is null");
+
+    std::uint16_t d_bits{};
+    std::memcpy(&d_bits, block + 0, sizeof(d_bits));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    d_bits = __builtin_bswap16(d_bits);
+#endif
+    const float d = fp16_to_fp32(d_bits);
+    const auto* qs =
+        reinterpret_cast<const std::int8_t*>(block + 4);
+
+    for (std::size_t i = 0;
+         i < kQ8_1ValuesPerBlock; ++i) {
+        out[i] = d * static_cast<float>(qs[i]);
+    }
+}
+
 std::vector<std::byte> quantize_q8_k_cpu(const float* values, std::size_t count) {
     if (!values) throw std::invalid_argument("Q8_K source is null");
     if (count == 0 || count % kQ4KValuesPerBlock != 0) {
