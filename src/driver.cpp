@@ -1228,6 +1228,90 @@ FSM_DONE:
 }
 )ptx";
 
+constexpr const char* kQ6KDequantPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_dequant_q6k_block(
+    .param .u64 p_block,
+    .param .u64 p_out
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<8>;
+
+    ld.param.u64 %rd1, [p_block];
+    ld.param.u64 %rd2, [p_out];
+
+    mov.u32 %r1, %tid.x;
+    setp.ge.u32 %p1, %r1, 256;
+    @%p1 bra Q6D_DONE;
+
+    shr.u32 %r2, %r1, 7;       // half 0..1
+    and.b32 %r3, %r1, 127;     // within half
+    shr.u32 %r4, %r3, 5;       // quarter 0..3
+    and.b32 %r5, %r3, 31;      // l 0..31
+    shr.u32 %r6, %r5, 4;       // is 0..1
+
+    // ql index = half*64 + (quarter&1)*32 + l
+    shl.b32 %r7, %r2, 6;
+    and.b32 %r8, %r4, 1;
+    shl.b32 %r8, %r8, 5;
+    add.u32 %r9, %r7, %r8;
+    add.u32 %r9, %r9, %r5;
+    cvt.u64.u32 %rd3, %r9;
+    add.s64 %rd4, %rd1, %rd3;
+    ld.global.u8 %r10, [%rd4];
+
+    // qh index = half*32 + l
+    shl.b32 %r11, %r2, 5;
+    add.u32 %r11, %r11, %r5;
+    cvt.u64.u32 %rd5, %r11;
+    add.s64 %rd6, %rd1, 128;
+    add.s64 %rd7, %rd6, %rd5;
+    ld.global.u8 %r12, [%rd7];
+
+    setp.ge.u32 %p2, %r4, 2;
+    @%p2 shr.u32 %r13, %r10, 4;
+    @!%p2 and.b32 %r13, %r10, 15;
+    and.b32 %r13, %r13, 15;
+
+    shl.b32 %r14, %r4, 1;
+    shr.u32 %r15, %r12, %r14;
+    and.b32 %r15, %r15, 3;
+    shl.b32 %r15, %r15, 4;
+    or.b32 %r16, %r13, %r15;
+    sub.s32 %r16, %r16, 32;
+
+    // scale index = half*8 + quarter*2 + is
+    shl.b32 %r17, %r2, 3;
+    shl.b32 %r18, %r4, 1;
+    add.u32 %r17, %r17, %r18;
+    add.u32 %r17, %r17, %r6;
+    cvt.u64.u32 %rd8, %r17;
+    add.s64 %rd9, %rd1, 192;
+    add.s64 %rd10, %rd9, %rd8;
+    ld.global.s8 %r19, [%rd10];
+
+    ld.global.b16 %r20, [%rd1+208];
+    cvt.f32.f16 %f1, %r20;
+    cvt.rn.f32.s32 %f2, %r19;
+    cvt.rn.f32.s32 %f3, %r16;
+    mul.rn.f32 %f4, %f1, %f2;
+    mul.rn.f32 %f5, %f4, %f3;
+
+    mul.wide.u32 %rd11, %r1, 4;
+    add.s64 %rd12, %rd2, %rd11;
+    st.global.f32 [%rd12], %f5;
+
+Q6D_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ6KGemvPtx = R"ptx(
 .version 7.1
 .target sm_86
