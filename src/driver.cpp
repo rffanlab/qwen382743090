@@ -5331,6 +5331,9 @@ bool NvidiaDriver::run_qwen35_layer0_gate_smoke(
             std::array<std::byte, kQ5KSm86BytesPerBlock> block_buf{};
             double abs_max = 0.0;
             double rel_max = 0.0;
+            bool tolerance_violation = false;
+            constexpr double kAbsTol = 3.0e-3;
+            constexpr double kRelTol = 3.0e-3;
 
             for (std::size_t row = 0; row < checked_rows; ++row) {
                 double ref = 0.0;
@@ -5354,11 +5357,14 @@ bool NvidiaDriver::run_qwen35_layer0_gate_smoke(
                 const double rel_err = abs_err / std::max(1.0e-5, std::abs(ref));
                 abs_max = std::max(abs_max, abs_err);
                 rel_max = std::max(rel_max, rel_err);
+                if (abs_err > kAbsTol && rel_err > kRelTol) {
+                    tolerance_violation = true;
+                }
             }
 
             if (max_abs_error) *max_abs_error = abs_max;
             if (max_rel_error) *max_rel_error = rel_max;
-            if (!(abs_max <= 3.0e-3 && rel_max <= 3.0e-3)) {
+            if (tolerance_violation) {
                 std::ostringstream oss;
                 oss << "Qwen3.8 layer0 norm->gate mismatch: max_abs=" << abs_max
                     << " max_rel=" << rel_max;
