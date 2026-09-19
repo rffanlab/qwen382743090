@@ -443,3 +443,29 @@ correctness:
     blk.0.ffn_down.weight
 
 并给每个 tensor 标记当前 runtime 支持状态（例如 Q5K_SM86_READY / NEED_Q6K_GEMV / NEED_IQ4_XS_GEMV / NEED_Q8_0_GEMV）。这个映射决定下一阶段 Qwen35LayerExecutor 的 kernel 优先级。
+
+
+### Q4_K recurrent projections
+
+Layer0 tensor map showed Qwen3.8 recurrent alpha/beta projections are native Q4_K:
+
+    blk.0.ssm_beta.weight   [5120,48]
+    blk.0.ssm_alpha.weight  [5120,48]
+
+The native PTX GEMV path can be validated directly:
+
+    ./build/q38-q4k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor blk.0.ssm_beta.weight
+
+    ./build/q38-q4k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor blk.0.ssm_alpha.weight
+
+### IQ4_XS FFN gate bring-up
+
+The layer0 FFN gate is the remaining large unsupported projection format:
+
+    blk.0.ffn_gate.weight  IQ4_XS  [5120,17408]
+
+Before building GEMV, validate a real 136-byte / 256-weight IQ4_XS block against an independent CPU reference:
+
+    ./build/q38-iq4xs-smoke --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+IQ4_XS uses the standard non-linear 16-value codebook and per-32-value signed scale. Once this smoke passes, the next step is the fused IQ4_XS GEMV / possible SM86 repack benchmark.
