@@ -33,6 +33,7 @@ const char* projection_kernel_name(ProjectionKernelKind kind) noexcept {
         case ProjectionKernelKind::F32Direct: return "F32_DIRECT";
         case ProjectionKernelKind::Q4KNative: return "Q4K_NATIVE";
         case ProjectionKernelKind::Q5KSm86Vectorized: return "Q5K_SM86_VEC";
+        case ProjectionKernelKind::Q6KNative: return "Q6K_NATIVE_VEC";
         case ProjectionKernelKind::IQ4XSPrmt: return "IQ4XS_PRMT";
         default: return "UNSUPPORTED";
     }
@@ -50,6 +51,10 @@ ProjectionKernelKind select_projection_kernel(const TensorRecord& tensor) noexce
     if (tensor.ggml_type == 13 &&
         tensor.layout == TensorLayout::Sm86Q5KSoA) {
         return ProjectionKernelKind::Q5KSm86Vectorized;
+    }
+    if (tensor.ggml_type == 14 &&
+        tensor.layout == TensorLayout::GgufNative) {
+        return ProjectionKernelKind::Q6KNative;
     }
     if (tensor.ggml_type == 23 &&
         tensor.layout == TensorLayout::GgufNative) {
