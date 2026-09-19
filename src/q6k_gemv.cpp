@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
         const auto rows =
             static_cast<std::uint32_t>(tensor->dims[1]);
 
-        std::cout << "Q38RT vectorized Q6_K GEMV\n";
+        std::cout << "Q38RT Q6_K GEMV golden scalar-stride\n";
         std::cout << "tensor: " << tensor->name << "\n";
         std::cout << "shape: [" << cols << "," << rows << "]\n";
         std::cout << "stored bytes: " << tensor->stored_bytes << "\n";
@@ -126,8 +126,8 @@ int main(int argc, char** argv) {
         std::cout << "kernel_ms: " << ms << "\n";
         std::cout << "effective_weight_bandwidth_GBps: "
                   << gbps << "\n";
-        std::cout << "kernel_mapping: 4warps_per_cta_16x2lane_groups\n";
-        std::cout << "decode: 8weights_per_lane_scale_after_reduction\n";
+        std::cout << "kernel_mapping: 1warp_per_row_lane_stride_32\n";
+        std::cout << "decode: exact_element_index_reference\n";
         std::cout << "q6_k_gemv: PASS\n";
         return 0;
     } catch (const std::exception& e) {
