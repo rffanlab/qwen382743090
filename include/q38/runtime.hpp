@@ -24,6 +24,7 @@ enum class ProjectionKernelKind {
     F32Direct,
     Q4KNative,
     Q5KSm86Vectorized,
+    Q6KNative,
     IQ4XSPrmt,
 };
 
