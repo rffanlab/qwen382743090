@@ -2092,8 +2092,7 @@ bool NvidiaDriver::run_q5k_q8k_gemv_smoke(
             std::uint32_t arg_rows = rows;
             void* params[] = {&arg_w, &arg_q8, &arg_y, &arg_cols, &arg_rows};
 
-            const unsigned int grid_rows4 = (rows + 3u) / 4u;
-            check(handle_, launch(fn, grid_rows4, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
+            check(handle_, launch(fn, rows, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
                   "cuLaunchKernel(q38_q5k_q8k_dp4a_gemv)");
             check(handle_, sync(), "cuCtxSynchronize(Q5_K x Q8_K correctness)");
             check(handle_, memcpy_dtoh(y.data(), y_ptr, y_bytes), "cuMemcpyDtoH(Q5_K x Q8_K)");
@@ -2138,7 +2137,7 @@ bool NvidiaDriver::run_q5k_q8k_gemv_smoke(
             constexpr int kIters = 50;
             const auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < kIters; ++i) {
-                check(handle_, launch(fn, grid_rows4, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
+                check(handle_, launch(fn, rows, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
                       "cuLaunchKernel(q38_q5k_q8k_dp4a_gemv benchmark)");
             }
             check(handle_, sync(), "cuCtxSynchronize(Q5_K x Q8_K benchmark)");
