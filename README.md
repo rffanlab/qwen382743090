@@ -720,3 +720,42 @@ Expected labels:
 
     kernel_mapping: 4warps_per_cta_8x4lane_groups
     decode: 8weights_per_lane_group_scale_after_reduction
+
+
+### Q5_K vectorized result: 565 GB/s
+
+The vectorized persistent SM86 Q5_K path is now the retained implementation.
+
+Real RTX 3090 result on `blk.0.attn_gate.weight [5120,6144]`:
+
+    previous persistent SM86 Q5_K:
+      0.0652 ms
+      331.6158 GB/s original-equivalent
+      339.1525 GB/s physical
+
+    vectorized SM86 Q5_K:
+      0.0382 ms
+      565.5825 GB/s original-equivalent
+      578.4367 GB/s physical
+
+Correctness:
+
+    max_abs_error: 6.473268e-07
+    max_rel_error: 2.778529e-05
+
+The winning kernel uses four warps per CTA and eight 4-lane subgroups per warp.
+Each lane processes eight Q5 weights. Group scale/min correction is applied
+after subgroup reduction instead of per weight.
+
+The real `q38-layer0-gate` chain now also uses this vectorized Q5_K kernel.
+
+Before treating the 565 GB/s figure as model-wide, benchmark the other major
+Q5_K shapes:
+
+    ./build/q38-q5k-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor blk.0.attn_qkv.weight
+
+    ./build/q38-q5k-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor blk.0.ffn_up.weight
+
+    ./build/q38-q5k-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor blk.0.ffn_down.weight
+
+    ./build/q38-layer0-gate --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
