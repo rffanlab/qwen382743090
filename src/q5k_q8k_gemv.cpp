@@ -36,6 +36,11 @@ int main(int argc, char** argv) {
             std::cerr << "q38-q5k-q8k-gemv: tensor not found: " << tensor_name << "\n";
             return 3;
         }
+        if (tensor->layout != q38::TensorLayout::GgufNative) {
+            std::cerr << "q38-q5k-q8k-gemv: this experiment requires GGUF_NATIVE Q5_K; "
+                      << "use q38-q5k-sm86-gemv for SM86_Q5K_SOA\n";
+            return 11;
+        }
         if (tensor->ggml_type != 13) {
             std::cerr << "q38-q5k-q8k-gemv: tensor is not GGML_TYPE_Q5_K (13), type="
                       << tensor->ggml_type << "\n";
