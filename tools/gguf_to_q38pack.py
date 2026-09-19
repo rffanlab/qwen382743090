@@ -117,7 +117,7 @@ class Reader:
         raise AssertionError(name)
 
 
-def parse_gguf(path: Path) -> GGUFInfo:
+def parse_gguf(path: Path, keep_metadata_arrays: bool = False) -> GGUFInfo:
     file_size = path.stat().st_size
     with path.open("rb") as fp:
         r = Reader(fp)
@@ -133,7 +133,10 @@ def parse_gguf(path: Path) -> GGUFInfo:
         for _ in range(kv_count):
             key = r.string()
             type_id = r.u32()
-            value = r.value(type_id, keep_array_values=False)
+            value = r.value(
+                type_id,
+                keep_array_values=keep_metadata_arrays,
+            )
             metadata[key] = value
             if key == "general.alignment":
                 alignment = int(value)
