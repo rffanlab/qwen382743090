@@ -4,6 +4,30 @@
 
 namespace q38 {
 
+const char* qwen35_layer_kind_name(Qwen35LayerKind kind) noexcept {
+    switch (kind) {
+        case Qwen35LayerKind::Recurrent: return "RECURRENT";
+        case Qwen35LayerKind::FullAttention: return "FULL_ATTENTION";
+        default: return "MISSING";
+    }
+}
+
+Qwen35LayerKind detect_qwen35_layer_kind(
+    const PackFile& pack,
+    std::uint32_t layer) noexcept {
+    const std::string prefix = "blk." + std::to_string(layer) + ".";
+    if (pack.find_tensor(prefix + "ssm_conv1d.weight")) {
+        return Qwen35LayerKind::Recurrent;
+    }
+    if (pack.find_tensor(prefix + "attn_q.weight") ||
+        pack.find_tensor(prefix + "attn_k.weight") ||
+        pack.find_tensor(prefix + "attn_v.weight") ||
+        pack.find_tensor(prefix + "attn_output.weight")) {
+        return Qwen35LayerKind::FullAttention;
+    }
+    return Qwen35LayerKind::Missing;
+}
+
 const char* projection_kernel_name(ProjectionKernelKind kind) noexcept {
     switch (kind) {
         case ProjectionKernelKind::F32Direct: return "F32_DIRECT";
@@ -420,6 +444,132 @@ bool Runtime::run_layer0_full(
                 t.aux1_offset - t.data_offset);
         };
 
+        return driver_.run_qwen35_layer0_full(
+            reinterpret_cast<const float*>(pack_.tensor_data(norm)),
+            pack_.tensor_data(qkv), qh_off(qkv), qs_off(qkv),
+            pack_.tensor_data(z), qh_off(z), qs_off(z),
+            pack_.tensor_data(beta),
+            pack_.tensor_data(alpha),
+            reinterpret_cast<const float*>(pack_.tensor_data(conv)),
+            reinterpret_cast<const float*>(pack_.tensor_data(dt)),
+            reinterpret_cast<const float*>(pack_.tensor_data(a)),
+            reinterpret_cast<const float*>(pack_.tensor_data(ssm_norm)),
+            pack_.tensor_data(ssm_out), qh_off(ssm_out), qs_off(ssm_out),
+            reinterpret_cast<const float*>(pack_.tensor_data(post_norm)),
+            pack_.tensor_data(ffn_gate),
+            pack_.tensor_data(ffn_up), qh_off(ffn_up), qs_off(ffn_up),
+            pack_.tensor_data(ffn_down), qh_off(ffn_down), qs_off(ffn_down),
+            rms_eps,
+            stats,
+            error);
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+
+bool Runtime::run_recurrent_layer(
+    std::uint32_t layer,
+    float rms_eps,
+    Layer0FullStats* stats,
+    std::string* error) {
+    try {
+        if (!driver_.available()) {
+            throw std::runtime_error(
+                "recurrent layer requires an initialized GPU driver");
+        }
+        if (detect_qwen35_layer_kind(pack_, layer) !=
+            Qwen35LayerKind::Recurrent) {
+            throw std::runtime_error(
+                "requested layer is not a recurrent Qwen3.8 layer");
+        }
+
+        const std::string p =
+            "blk." + std::to_string(layer) + ".";
+
+        auto require = [&](const std::string& suffix)
+            -> const TensorRecord& {
+            const std::string name = p + suffix;
+            const auto* tensor = pack_.find_tensor(name);
+            if (!tensor) {
+                throw std::runtime_error(
+                    "missing tensor: " + name);
+            }
+            return *tensor;
+        };
+
+        const auto& norm       = require("attn_norm.weight");
+        const auto& qkv        = require("attn_qkv.weight");
+        const auto& z          = require("attn_gate.weight");
+        const auto& beta       = require("ssm_beta.weight");
+        const auto& alpha      = require("ssm_alpha.weight");
+        const auto& conv       = require("ssm_conv1d.weight");
+        const auto& dt         = require("ssm_dt.bias");
+        const auto& a          = require("ssm_a");
+        const auto& ssm_norm   = require("ssm_norm.weight");
+        const auto& ssm_out    = require("ssm_out.weight");
+        const auto& post_norm  = require("post_attention_norm.weight");
+        const auto& ffn_gate   = require("ffn_gate.weight");
+        const auto& ffn_up     = require("ffn_up.weight");
+        const auto& ffn_down   = require("ffn_down.weight");
+
+        if (select_projection_kernel(norm) != ProjectionKernelKind::F32Direct ||
+            select_projection_kernel(qkv) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(z) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(beta) != ProjectionKernelKind::Q4KNative ||
+            select_projection_kernel(alpha) != ProjectionKernelKind::Q4KNative ||
+            select_projection_kernel(ssm_out) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(post_norm) != ProjectionKernelKind::F32Direct ||
+            select_projection_kernel(ffn_gate) != ProjectionKernelKind::IQ4XSPrmt ||
+            select_projection_kernel(ffn_up) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(ffn_down) != ProjectionKernelKind::Q5KSm86Vectorized) {
+            throw std::runtime_error(
+                "recurrent layer kernel dispatch mismatch at " +
+                std::to_string(layer));
+        }
+
+        if (conv.ggml_type != 0 || dt.ggml_type != 0 ||
+            a.ggml_type != 0 || ssm_norm.ggml_type != 0 ||
+            conv.layout != TensorLayout::GgufNative ||
+            dt.layout != TensorLayout::GgufNative ||
+            a.layout != TensorLayout::GgufNative ||
+            ssm_norm.layout != TensorLayout::GgufNative) {
+            throw std::runtime_error(
+                "recurrent layer F32 tensor layout mismatch at " +
+                std::to_string(layer));
+        }
+
+        if (norm.dims[0] != 5120 ||
+            qkv.dims[0] != 5120 || qkv.dims[1] != 10240 ||
+            z.dims[0] != 5120 || z.dims[1] != 6144 ||
+            beta.dims[0] != 5120 || beta.dims[1] != 48 ||
+            alpha.dims[0] != 5120 || alpha.dims[1] != 48 ||
+            conv.dims[0] != 4 || conv.dims[1] != 10240 ||
+            dt.dims[0] != 48 || a.dims[0] != 48 ||
+            ssm_norm.dims[0] != 128 ||
+            ssm_out.dims[0] != 6144 || ssm_out.dims[1] != 5120 ||
+            post_norm.dims[0] != 5120 ||
+            ffn_gate.dims[0] != 5120 || ffn_gate.dims[1] != 17408 ||
+            ffn_up.dims[0] != 5120 || ffn_up.dims[1] != 17408 ||
+            ffn_down.dims[0] != 17408 || ffn_down.dims[1] != 5120) {
+            throw std::runtime_error(
+                "recurrent layer tensor shape mismatch at " +
+                std::to_string(layer));
+        }
+
+        auto qh_off = [](const TensorRecord& t) {
+            return static_cast<std::size_t>(
+                t.aux0_offset - t.data_offset);
+        };
+        auto qs_off = [](const TensorRecord& t) {
+            return static_cast<std::size_t>(
+                t.aux1_offset - t.data_offset);
+        };
+
+        // The native driver kernel is shape-specialized rather than
+        // layer-index-specialized, so the validated layer0 implementation
+        // is intentionally reused with this layer's real tensors.
         return driver_.run_qwen35_layer0_full(
             reinterpret_cast<const float*>(pack_.tensor_data(norm)),
             pack_.tensor_data(qkv), qh_off(qkv), qs_off(qkv),
