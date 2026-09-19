@@ -5819,6 +5819,448 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
 
 
 
+
+bool NvidiaDriver::run_recurrent_prep_smoke(
+    const float* conv_weight,
+    const float* dt_bias,
+    const float* ssm_a,
+    RecurrentPrepSmokeStats* stats,
+    std::string* error) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error(
+                "q38 recurrent prep smoke requires sm_86; detected sm_" +
+                std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (!conv_weight || !dt_bias || !ssm_a) {
+            throw std::invalid_argument("recurrent prep received null real-model tensor");
+        }
+
+        constexpr std::uint32_t kChannels = 10240;
+        constexpr std::uint32_t kKeyDim = 2048;
+        constexpr std::uint32_t kHeads = 16;
+        constexpr std::uint32_t kHeadDim = 128;
+        constexpr std::uint32_t kValueHeads = 48;
+        constexpr std::uint32_t kConvStateSteps = 3;
+        constexpr float kNormEps = 1.0e-6f;
+
+        std::vector<float> qkv(kChannels);
+        std::vector<float> beta_raw(kValueHeads);
+        std::vector<float> alpha_raw(kValueHeads);
+        std::vector<float> state_in(
+            static_cast<std::size_t>(kConvStateSteps) * kChannels);
+
+        for (std::uint32_t i = 0; i < kChannels; ++i) {
+            const float fi = static_cast<float>(i);
+            qkv[i] =
+                0.55f * std::sin(fi * 0.013f) +
+                0.31f * std::cos(fi * 0.007f);
+            for (std::uint32_t s = 0; s < kConvStateSteps; ++s) {
+                const float fs = static_cast<float>(s + 1);
+                state_in[static_cast<std::size_t>(s) * kChannels + i] =
+                    0.10f * std::sin(fi * (0.003f + 0.001f * fs)) +
+                    0.04f * std::cos(fi * (0.002f + 0.0005f * fs));
+            }
+        }
+        for (std::uint32_t h = 0; h < kValueHeads; ++h) {
+            const float fh = static_cast<float>(h);
+            beta_raw[h] = 0.2f * std::sin(fh * 0.21f) - 0.05f;
+            alpha_raw[h] = 0.3f * std::cos(fh * 0.17f) - 0.1f;
+        }
+
+        std::vector<float> conv_ref(kChannels);
+        std::vector<float> q_ref(kKeyDim);
+        std::vector<float> k_ref(kKeyDim);
+        std::vector<float> beta_ref(kValueHeads);
+        std::vector<float> gate_ref(kValueHeads);
+        std::vector<float> state_ref(
+            static_cast<std::size_t>(kConvStateSteps) * kChannels);
+
+        for (std::uint32_t ch = 0; ch < kChannels; ++ch) {
+            const float x0 = state_in[ch];
+            const float x1 = state_in[kChannels + ch];
+            const float x2 = state_in[2 * kChannels + ch];
+            const float x3 = qkv[ch];
+            const float* w = conv_weight + static_cast<std::size_t>(ch) * 4;
+            const double raw =
+                static_cast<double>(x0) * w[0] +
+                static_cast<double>(x1) * w[1] +
+                static_cast<double>(x2) * w[2] +
+                static_cast<double>(x3) * w[3];
+            const double silu = raw / (1.0 + std::exp(-raw));
+            conv_ref[ch] = static_cast<float>(silu);
+            state_ref[ch] = x1;
+            state_ref[kChannels + ch] = x2;
+            state_ref[2 * kChannels + ch] = x3;
+        }
+
+        for (std::uint32_t hk = 0; hk < kHeads; ++hk) {
+            double q_ss = 0.0;
+            double k_ss = 0.0;
+            const std::size_t q_base =
+                static_cast<std::size_t>(hk) * kHeadDim;
+            const std::size_t k_base =
+                kKeyDim + static_cast<std::size_t>(hk) * kHeadDim;
+            for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                const double qv = conv_ref[q_base + i];
+                const double kv = conv_ref[k_base + i];
+                q_ss += qv * qv;
+                k_ss += kv * kv;
+            }
+            const double q_inv = 1.0 / std::sqrt(q_ss + kNormEps);
+            const double k_inv = 1.0 / std::sqrt(k_ss + kNormEps);
+            for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                q_ref[q_base + i] =
+                    static_cast<float>(
+                        static_cast<double>(conv_ref[q_base + i]) * q_inv);
+                k_ref[q_base + i] =
+                    static_cast<float>(
+                        static_cast<double>(conv_ref[k_base + i]) * k_inv);
+            }
+        }
+
+        auto softplus = [](double x) {
+            if (x > 20.0) return x;
+            if (x < -20.0) return std::exp(x);
+            return std::log1p(std::exp(x));
+        };
+        for (std::uint32_t h = 0; h < kValueHeads; ++h) {
+            const double br = beta_raw[h];
+            beta_ref[h] =
+                static_cast<float>(1.0 / (1.0 + std::exp(-br)));
+            const double biased =
+                static_cast<double>(alpha_raw[h]) +
+                static_cast<double>(dt_bias[h]);
+            gate_ref[h] =
+                static_cast<float>(
+                    softplus(biased) *
+                    static_cast<double>(ssm_a[h]));
+        }
+
+        const std::size_t qkv_bytes = qkv.size() * sizeof(float);
+        const std::size_t conv_w_bytes =
+            static_cast<std::size_t>(kChannels) * 4 * sizeof(float);
+        const std::size_t state_bytes =
+            state_in.size() * sizeof(float);
+        const std::size_t qk_bytes =
+            static_cast<std::size_t>(kKeyDim) * sizeof(float);
+        const std::size_t small_bytes =
+            static_cast<std::size_t>(kValueHeads) * sizeof(float);
+
+        auto align256 = [](std::size_t n) {
+            return (n + 255u) & ~std::size_t(255u);
+        };
+
+        const std::size_t qkv_off = 0;
+        const std::size_t conv_w_off = align256(qkv_off + qkv_bytes);
+        const std::size_t state_in_off = align256(conv_w_off + conv_w_bytes);
+        const std::size_t conv_out_off = align256(state_in_off + state_bytes);
+        const std::size_t state_out_off = align256(conv_out_off + qkv_bytes);
+        const std::size_t q_out_off = align256(state_out_off + state_bytes);
+        const std::size_t k_out_off = align256(q_out_off + qk_bytes);
+        const std::size_t beta_raw_off = align256(k_out_off + qk_bytes);
+        const std::size_t alpha_raw_off = align256(beta_raw_off + small_bytes);
+        const std::size_t dt_off = align256(alpha_raw_off + small_bytes);
+        const std::size_t a_off = align256(dt_off + small_bytes);
+        const std::size_t beta_out_off = align256(a_off + small_bytes);
+        const std::size_t gate_out_off = align256(beta_out_off + small_bytes);
+        const std::size_t total_bytes = gate_out_off + small_bytes;
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD =
+            CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH =
+            CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using ModuleLoadDataEx =
+            CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction =
+            CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel =
+            CUresult(*)(CUfunction,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod =
+            sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh =
+            sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto module_load_ex =
+            sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload =
+            sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function =
+            sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch =
+            sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync =
+            sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        const CUdeviceptr base = memory.ptr();
+        const CUdeviceptr qkv_ptr = base + qkv_off;
+        const CUdeviceptr conv_w_ptr = base + conv_w_off;
+        const CUdeviceptr state_in_ptr = base + state_in_off;
+        const CUdeviceptr conv_out_ptr = base + conv_out_off;
+        const CUdeviceptr state_out_ptr = base + state_out_off;
+        const CUdeviceptr q_out_ptr = base + q_out_off;
+        const CUdeviceptr k_out_ptr = base + k_out_off;
+        const CUdeviceptr beta_raw_ptr = base + beta_raw_off;
+        const CUdeviceptr alpha_raw_ptr = base + alpha_raw_off;
+        const CUdeviceptr dt_ptr = base + dt_off;
+        const CUdeviceptr a_ptr = base + a_off;
+        const CUdeviceptr beta_out_ptr = base + beta_out_off;
+        const CUdeviceptr gate_out_ptr = base + gate_out_off;
+
+        check(handle_, memcpy_htod(qkv_ptr, qkv.data(), qkv_bytes),
+              "cuMemcpyHtoD(recurrent qkv)");
+        check(handle_, memcpy_htod(conv_w_ptr, conv_weight, conv_w_bytes),
+              "cuMemcpyHtoD(recurrent conv weight)");
+        check(handle_, memcpy_htod(state_in_ptr, state_in.data(), state_bytes),
+              "cuMemcpyHtoD(recurrent conv state)");
+        check(handle_, memcpy_htod(beta_raw_ptr, beta_raw.data(), small_bytes),
+              "cuMemcpyHtoD(recurrent beta raw)");
+        check(handle_, memcpy_htod(alpha_raw_ptr, alpha_raw.data(), small_bytes),
+              "cuMemcpyHtoD(recurrent alpha raw)");
+        check(handle_, memcpy_htod(dt_ptr, dt_bias, small_bytes),
+              "cuMemcpyHtoD(recurrent dt)");
+        check(handle_, memcpy_htod(a_ptr, ssm_a, small_bytes),
+              "cuMemcpyHtoD(recurrent a)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto rc = module_load_ex(
+            &module,
+            kRecurrentPrepPtx,
+            static_cast<unsigned int>(
+                sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (rc != CUDA_SUCCESS) {
+            std::string detail =
+                cuda_error(handle_, rc, "cuModuleLoadDataEx(recurrent prep)");
+            if (jit_error[0] != '\0') {
+                detail +=
+                    std::string("\nPTX JIT error log:\n") +
+                    jit_error.data();
+            }
+            if (jit_info[0] != '\0') {
+                detail +=
+                    std::string("\nPTX JIT info log:\n") +
+                    jit_info.data();
+            }
+            throw std::runtime_error(detail);
+        }
+
+        try {
+            CUfunction conv_fn{}, qk_fn{}, bg_fn{};
+            check(handle_, module_get_function(
+                &conv_fn, module, "q38_conv4_silu_roll"),
+                "cuModuleGetFunction(q38_conv4_silu_roll)");
+            check(handle_, module_get_function(
+                &qk_fn, module, "q38_qk_l2norm_128"),
+                "cuModuleGetFunction(q38_qk_l2norm_128)");
+            check(handle_, module_get_function(
+                &bg_fn, module, "q38_beta_gate_48"),
+                "cuModuleGetFunction(q38_beta_gate_48)");
+
+            CUdeviceptr c_qkv = qkv_ptr;
+            CUdeviceptr c_w = conv_w_ptr;
+            CUdeviceptr c_si = state_in_ptr;
+            CUdeviceptr c_co = conv_out_ptr;
+            CUdeviceptr c_so = state_out_ptr;
+            std::uint32_t c_channels = kChannels;
+            float log2e = 1.4426950408889634f;
+            void* conv_params[] = {
+                &c_qkv, &c_w, &c_si, &c_co, &c_so, &c_channels, &log2e
+            };
+
+            CUdeviceptr n_conv = conv_out_ptr;
+            CUdeviceptr n_q = q_out_ptr;
+            CUdeviceptr n_k = k_out_ptr;
+            float norm_eps = kNormEps;
+            void* qk_params[] = {
+                &n_conv, &n_q, &n_k, &norm_eps
+            };
+
+            CUdeviceptr b_br = beta_raw_ptr;
+            CUdeviceptr b_ar = alpha_raw_ptr;
+            CUdeviceptr b_dt = dt_ptr;
+            CUdeviceptr b_a = a_ptr;
+            CUdeviceptr b_bo = beta_out_ptr;
+            CUdeviceptr b_go = gate_out_ptr;
+            float inv_log2e = 0.6931471805599453f;
+            void* bg_params[] = {
+                &b_br, &b_ar, &b_dt, &b_a, &b_bo, &b_go,
+                &log2e, &inv_log2e
+            };
+
+            const unsigned int conv_grid =
+                (kChannels + 255u) / 256u;
+
+            auto launch_conv = [&]() {
+                check(handle_, launch(
+                    conv_fn, conv_grid, 1, 1,
+                    256, 1, 1,
+                    0, nullptr, conv_params, nullptr),
+                    "cuLaunchKernel(recurrent conv+silu)");
+            };
+            auto launch_qk = [&]() {
+                check(handle_, launch(
+                    qk_fn, 32, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, qk_params, nullptr),
+                    "cuLaunchKernel(recurrent qk norm)");
+            };
+            auto launch_bg = [&]() {
+                check(handle_, launch(
+                    bg_fn, 1, 1, 1,
+                    64, 1, 1,
+                    0, nullptr, bg_params, nullptr),
+                    "cuLaunchKernel(recurrent beta/gate)");
+            };
+
+            launch_conv();
+            launch_qk();
+            launch_bg();
+            check(handle_, sync(),
+                  "cuCtxSynchronize(recurrent prep correctness)");
+
+            std::vector<float> conv_gpu(kChannels);
+            std::vector<float> q_gpu(kKeyDim);
+            std::vector<float> k_gpu(kKeyDim);
+            std::vector<float> beta_gpu(kValueHeads);
+            std::vector<float> gate_gpu(kValueHeads);
+            std::vector<float> state_gpu(state_in.size());
+
+            check(handle_, memcpy_dtoh(
+                conv_gpu.data(), conv_out_ptr, qkv_bytes),
+                "cuMemcpyDtoH(recurrent conv)");
+            check(handle_, memcpy_dtoh(
+                q_gpu.data(), q_out_ptr, qk_bytes),
+                "cuMemcpyDtoH(recurrent q)");
+            check(handle_, memcpy_dtoh(
+                k_gpu.data(), k_out_ptr, qk_bytes),
+                "cuMemcpyDtoH(recurrent k)");
+            check(handle_, memcpy_dtoh(
+                beta_gpu.data(), beta_out_ptr, small_bytes),
+                "cuMemcpyDtoH(recurrent beta)");
+            check(handle_, memcpy_dtoh(
+                gate_gpu.data(), gate_out_ptr, small_bytes),
+                "cuMemcpyDtoH(recurrent gate)");
+            check(handle_, memcpy_dtoh(
+                state_gpu.data(), state_out_ptr, state_bytes),
+                "cuMemcpyDtoH(recurrent conv state)");
+
+            RecurrentPrepSmokeStats local{};
+            auto max_abs = [](const std::vector<float>& a,
+                              const std::vector<float>& b) {
+                double m = 0.0;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    m = std::max(
+                        m,
+                        std::abs(
+                            static_cast<double>(a[i]) -
+                            static_cast<double>(b[i])));
+                }
+                return m;
+            };
+
+            local.conv_max_abs = max_abs(conv_gpu, conv_ref);
+            local.q_max_abs = max_abs(q_gpu, q_ref);
+            local.k_max_abs = max_abs(k_gpu, k_ref);
+            local.beta_max_abs = max_abs(beta_gpu, beta_ref);
+            local.gate_max_abs = max_abs(gate_gpu, gate_ref);
+            local.conv_state_max_abs = max_abs(state_gpu, state_ref);
+
+            if (local.conv_max_abs > 5.0e-4 ||
+                local.q_max_abs > 5.0e-4 ||
+                local.k_max_abs > 5.0e-4 ||
+                local.beta_max_abs > 5.0e-5 ||
+                local.gate_max_abs > 5.0e-4 ||
+                local.conv_state_max_abs > 1.0e-7) {
+                std::ostringstream oss;
+                oss << "recurrent prep mismatch: conv=" << local.conv_max_abs
+                    << " q=" << local.q_max_abs
+                    << " k=" << local.k_max_abs
+                    << " beta=" << local.beta_max_abs
+                    << " gate=" << local.gate_max_abs
+                    << " state=" << local.conv_state_max_abs;
+                throw std::runtime_error(oss.str());
+            }
+
+            auto bench = [&](int iters, auto&& fn, const char* label) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < iters; ++i) fn();
+                check(handle_, sync(), label);
+                const auto t1 = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::milli>(
+                    t1 - t0).count() /
+                    static_cast<double>(iters);
+            };
+
+            local.conv_silu_ms =
+                bench(200, launch_conv,
+                      "cuCtxSynchronize(recurrent conv benchmark)");
+            local.qk_norm_ms =
+                bench(500, launch_qk,
+                      "cuCtxSynchronize(recurrent qk benchmark)");
+            local.beta_gate_ms =
+                bench(1000, launch_bg,
+                      "cuCtxSynchronize(recurrent beta/gate benchmark)");
+
+            auto chain = [&]() {
+                launch_conv();
+                launch_qk();
+                launch_bg();
+            };
+            local.chain_ms =
+                bench(200, chain,
+                      "cuCtxSynchronize(recurrent prep chain benchmark)");
+
+            if (stats) *stats = local;
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+
+        check(handle_, module_unload(module),
+              "cuModuleUnload(recurrent prep)");
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 bool NvidiaDriver::run_gdn_ar_smoke(
     std::uint32_t state_dim,
     std::uint32_t qk_heads,
