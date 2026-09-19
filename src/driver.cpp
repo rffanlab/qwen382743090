@@ -1467,6 +1467,251 @@ IQQ_DONE:
 }
 )ptx";
 
+constexpr const char* kIQ4XSGemvPrmtPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+// Native IQ4_XS x F32, vectorized nonlinear decode.
+// One CTA has four warps; each warp computes one output row.
+// Within a warp, eight 4-lane subgroups map 1:1 to the eight 32-value
+// groups of each IQ4_XS superblock. Every lane loads four packed bytes
+// (8 weights), resolves all eight codebook values with prmt.b32, and
+// performs eight F32 FMAs. Group scale is applied only after the 4-lane
+// subgroup reduction.
+.visible .entry q38_iq4xs_gemv_f32_prmt(
+    .param .u64 p_weights,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<24>;
+    .reg .b32 %r<112>;
+    .reg .b64 %rd<40>;
+    .reg .f32 %f<40>;
+
+    ld.param.u64 %rd1, [p_weights];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 5;       // warp id 0..3
+    and.b32 %r6, %r4, 31;      // lane 0..31
+    shl.b32 %r7, %r3, 2;
+    add.u32 %r7, %r7, %r5;     // output row
+
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra IQP_DONE;
+
+    shr.u32 %r8, %r6, 2;       // group 0..7
+    and.b32 %r9, %r6, 3;       // sublane 0..3
+
+    // blocks_per_row and row base
+    shr.u32 %r10, %r1, 8;
+    mul.lo.u32 %r11, %r10, 136;
+    mul.wide.u32 %rd4, %r7, %r11;
+    add.s64 %rd5, %rd1, %rd4;
+
+    // Nonlinear IQ4 codebook bytes:
+    // [-127,-104,-83,-65], [-49,-35,-22,-10],
+    // [1,13,25,38], [53,69,89,113].
+    mov.u32 %r80, 0xBFAD9881;
+    mov.u32 %r81, 0xF6EADDCF;
+    mov.u32 %r82, 0x26190D01;
+    mov.u32 %r83, 0x71594535;
+
+    mov.u32 %r12, 0;            // block index
+    mov.f32 %f20, 0f00000000;   // valid in subgroup leaders
+
+IQP_BLOCK_LOOP:
+    setp.ge.u32 %p2, %r12, %r10;
+    @%p2 bra IQP_BLOCKS_DONE;
+
+    mul.wide.u32 %rd6, %r12, 136;
+    add.s64 %rd7, %rd5, %rd6;
+
+    // q4 = 4 consecutive qs bytes for this group/sublane.
+    shl.b32 %r13, %r8, 4;      // group*16
+    shl.b32 %r14, %r9, 2;      // sublane*4
+    add.u32 %r15, %r13, %r14;
+    cvt.u64.u32 %rd8, %r15;
+    add.s64 %rd9, %rd7, 8;
+    add.s64 %rd10, %rd9, %rd8;
+    ld.global.u32 %r16, [%rd10];
+
+    // Emulate CUDA __byte_perm for 8 nonlinear table lookups.
+    // First four nibbles (low 16 bits of q4).
+    and.b32 %r17, %r16, 0x00007777;
+    prmt.b32 %r18, %r80, %r81, %r17;
+    prmt.b32 %r19, %r82, %r83, %r17;
+    and.b32 %r20, %r16, 0x00008888;
+    shr.u32 %r20, %r20, 1;
+    or.b32 %r20, %r20, 0x00003210;
+    prmt.b32 %r21, %r18, %r19, %r20;
+
+    // Second four nibbles (high 16 bits of q4).
+    shr.u32 %r22, %r16, 16;
+    and.b32 %r23, %r22, 0x00007777;
+    prmt.b32 %r24, %r80, %r81, %r23;
+    prmt.b32 %r25, %r82, %r83, %r23;
+    and.b32 %r26, %r22, 0x00008888;
+    shr.u32 %r26, %r26, 1;
+    or.b32 %r26, %r26, 0x00003210;
+    prmt.b32 %r27, %r24, %r25, %r26;
+
+    // Gather low nibbles of the 4 source bytes into r28 and
+    // high nibbles into r29. Each register contains four signed int8 values.
+    prmt.b32 %r28, %r21, %r27, 0x00006420;
+    prmt.b32 %r29, %r21, %r27, 0x00007531;
+
+    // Activation indices:
+    // low nibble weights -> group*32 + sublane*4 + [0..3]
+    // high nibble weights -> +16.
+    shl.b32 %r30, %r12, 8;     // block*256
+    shl.b32 %r31, %r8, 5;      // group*32
+    add.u32 %r32, %r30, %r31;
+    add.u32 %r32, %r32, %r14;
+    mul.wide.u32 %rd11, %r32, 4;
+    add.s64 %rd12, %rd2, %rd11;
+
+    ld.global.v4.f32 {%f1,%f2,%f3,%f4}, [%rd12];
+    add.s64 %rd13, %rd12, 64;
+    ld.global.v4.f32 {%f5,%f6,%f7,%f8}, [%rd13];
+
+    mov.f32 %f9, 0f00000000;
+
+    // r28 byte 0
+    shl.b32 %r40, %r28, 24;
+    shr.s32 %r40, %r40, 24;
+    cvt.rn.f32.s32 %f10, %r40;
+    fma.rn.f32 %f9, %f10, %f1, %f9;
+
+    // r28 byte 1
+    shr.u32 %r41, %r28, 8;
+    shl.b32 %r41, %r41, 24;
+    shr.s32 %r41, %r41, 24;
+    cvt.rn.f32.s32 %f11, %r41;
+    fma.rn.f32 %f9, %f11, %f2, %f9;
+
+    // r28 byte 2
+    shr.u32 %r42, %r28, 16;
+    shl.b32 %r42, %r42, 24;
+    shr.s32 %r42, %r42, 24;
+    cvt.rn.f32.s32 %f12, %r42;
+    fma.rn.f32 %f9, %f12, %f3, %f9;
+
+    // r28 byte 3
+    shr.u32 %r43, %r28, 24;
+    shl.b32 %r43, %r43, 24;
+    shr.s32 %r43, %r43, 24;
+    cvt.rn.f32.s32 %f13, %r43;
+    fma.rn.f32 %f9, %f13, %f4, %f9;
+
+    // r29 byte 0
+    shl.b32 %r44, %r29, 24;
+    shr.s32 %r44, %r44, 24;
+    cvt.rn.f32.s32 %f14, %r44;
+    fma.rn.f32 %f9, %f14, %f5, %f9;
+
+    // r29 byte 1
+    shr.u32 %r45, %r29, 8;
+    shl.b32 %r45, %r45, 24;
+    shr.s32 %r45, %r45, 24;
+    cvt.rn.f32.s32 %f15, %r45;
+    fma.rn.f32 %f9, %f15, %f6, %f9;
+
+    // r29 byte 2
+    shr.u32 %r46, %r29, 16;
+    shl.b32 %r46, %r46, 24;
+    shr.s32 %r46, %r46, 24;
+    cvt.rn.f32.s32 %f16, %r46;
+    fma.rn.f32 %f9, %f16, %f7, %f9;
+
+    // r29 byte 3
+    shr.u32 %r47, %r29, 24;
+    shl.b32 %r47, %r47, 24;
+    shr.s32 %r47, %r47, 24;
+    cvt.rn.f32.s32 %f17, %r47;
+    fma.rn.f32 %f9, %f17, %f8, %f9;
+
+    // Reduce 4 lanes inside each group.
+    mov.b32 %r48, %f9;
+    shfl.sync.bfly.b32 %r49, %r48, 2, 31, 0xffffffff;
+    mov.b32 %f18, %r49;
+    add.rn.f32 %f9, %f9, %f18;
+    mov.b32 %r48, %f9;
+    shfl.sync.bfly.b32 %r49, %r48, 1, 31, 0xffffffff;
+    mov.b32 %f18, %r49;
+    add.rn.f32 %f9, %f9, %f18;
+
+    // Only subgroup leader loads/applies block d and signed group scale.
+    setp.ne.u32 %p3, %r9, 0;
+    @%p3 bra IQP_NEXT_BLOCK;
+
+    ld.global.b16 %r50, [%rd7+0];
+    ld.global.b16 %r51, [%rd7+2];
+    cvt.f32.f16 %f21, %r50;
+
+    shr.u32 %r52, %r8, 1;
+    cvt.u64.u32 %rd14, %r52;
+    add.s64 %rd15, %rd7, 4;
+    add.s64 %rd16, %rd15, %rd14;
+    ld.global.u8 %r53, [%rd16];
+
+    and.b32 %r54, %r8, 1;
+    shl.b32 %r54, %r54, 2;
+    shr.u32 %r55, %r53, %r54;
+    and.b32 %r55, %r55, 15;
+
+    shl.b32 %r56, %r8, 1;
+    shr.u32 %r57, %r51, %r56;
+    and.b32 %r57, %r57, 3;
+    shl.b32 %r57, %r57, 4;
+    or.b32 %r58, %r55, %r57;
+    sub.s32 %r58, %r58, 32;
+
+    cvt.rn.f32.s32 %f22, %r58;
+    mul.rn.f32 %f23, %f21, %f22;
+    fma.rn.f32 %f20, %f9, %f23, %f20;
+
+IQP_NEXT_BLOCK:
+    add.u32 %r12, %r12, 1;
+    bra IQP_BLOCK_LOOP;
+
+IQP_BLOCKS_DONE:
+    // f20 is valid in lanes 0,4,8,...28. Reduce those 8 group leaders.
+    mov.b32 %r60, %f20;
+    shfl.sync.down.b32 %r61, %r60, 16, 31, 0xffffffff;
+    mov.b32 %f24, %r61;
+    add.rn.f32 %f20, %f20, %f24;
+
+    mov.b32 %r60, %f20;
+    shfl.sync.down.b32 %r61, %r60, 8, 31, 0xffffffff;
+    mov.b32 %f24, %r61;
+    add.rn.f32 %f20, %f20, %f24;
+
+    mov.b32 %r60, %f20;
+    shfl.sync.down.b32 %r61, %r60, 4, 31, 0xffffffff;
+    mov.b32 %f24, %r61;
+    add.rn.f32 %f20, %f20, %f24;
+
+    setp.ne.u32 %p4, %r6, 0;
+    @%p4 bra IQP_DONE;
+
+    mul.wide.u32 %rd17, %r7, 4;
+    add.s64 %rd18, %rd3, %rd17;
+    st.global.f32 [%rd18], %f20;
+
+IQP_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ5KDequantPtx = R"ptx(
 .version 7.1
 .target sm_86
