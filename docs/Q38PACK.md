@@ -1,18 +1,17 @@
-# Q38PACK v1
+# Q38PACK v1/v2
 
-Q38PACK is the model container used by qwen382743090. It is intentionally
-narrow: Qwen3.8-27B on RTX 3090 / SM86 is the first target.
+Q38PACK is the execution container used by Q38RT. The first optimization target is Qwen3.8-27B on RTX 3090 / GA102 / SM86.
 
-## Goals
+## Compatibility
 
-- Constant-time mmap of model metadata and tensor directory.
-- 4 KiB default tensor alignment for future Driver API / VMM mapping.
-- No runtime dependency on GGUF parsing.
-- Preserve the original GGUF metadata region losslessly.
-- Preserve quantized tensor payloads byte-for-byte in v1.
-- Allow future SM86-specific repacks without changing the public server API.
+- v1: source-preserving container. Tensor payloads are copied from GGUF.
+- v2: same 256-byte header and tensor-directory entry size, with per-tensor execution-layout metadata in the 24 bytes that were reserved by v1.
+- The C++ and Python readers accept both v1 and v2.
+- The original GGUF header, metadata and tensor directory remain embedded in raw_gguf_meta in both versions.
 
-## File layout
+No Q38PACK v2 layout is allowed to change decoded model weights. Specialized layouts are byte/layout transforms, not requantization.
+
+## Top-level layout
 
 All integer fields are little-endian.
 
@@ -21,12 +20,12 @@ All integer fields are little-endian.
     compact JSON manifest
     raw GGUF metadata region
     padding to pack alignment
-    tensor payloads with per-tensor alignment
+    tensor payloads / execution layouts
 
-### Header fields
+## Header
 
     char[8]  magic = "Q38PACK\0"
-    u32      version = 1
+    u32      version = 1 or 2
     u32      header_bytes = 256
     u32      flags
     u32      tensor_count
@@ -43,11 +42,11 @@ All integer fields are little-endian.
     u64      source_file_size
     u64      source_data_offset
 
-The remaining bytes in the 256-byte header are reserved.
+## Tensor directory
 
-### Tensor directory entry
+Every entry remains exactly 256 bytes.
 
-Every entry is exactly 256 bytes.
+### v1
 
     char[160] name
     u32       ndim
@@ -58,17 +57,81 @@ Every entry is exactly 256 bytes.
     u64       source_offset
     u32       role
     u32       flags
-    ...       reserved to 256 bytes
+    u8[24]    reserved
 
-stored_bytes is the source GGUF storage span for the tensor. In v1 this can
-include alignment bytes at the end of a tensor span. This is deliberate: v1
-copies the source storage exactly and does not reinterpret quantization blocks.
+### v2
 
-## Compatibility contract
+The first 232 bytes are unchanged. The former 24-byte reserved tail becomes:
 
-The converter embeds the original GGUF header, key/value metadata, and tensor
-directory in raw_gguf_meta. This lets future versions recover tokenizer data
-and metadata that are intentionally summarized in the compact JSON manifest.
+    u32       layout
+    u32       layout_flags
+    u64       aux0_offset
+    u64       aux1_offset
 
-Q38PACK v1 is a container conversion only. It does not requantize weights and
-therefore must not introduce model-quality changes by itself.
+Current layout IDs:
+
+    0 = GGUF_NATIVE
+    1 = SM86_Q5K_SOA
+
+data_offset points to the primary plane. stored_bytes is the physical span owned by the tensor, including internal plane-alignment padding. aux0_offset and aux1_offset are absolute file offsets.
+
+## SM86_Q5K_SOA
+
+Real RTX 3090 measurements on blk.0.attn_gate.weight [5120,6144] showed:
+
+    GGUF-native Q5_K:
+      0.0864 ms
+      ~250.2 GB/s effective weight bandwidth
+
+    SM86 Q5_K SoA prototype:
+      0.0651 ms
+      ~332.3 GB/s original-Q5_K-equivalent bandwidth
+      ~339.9 GB/s physical repacked bandwidth
+
+Decoded weights remained exactly equivalent in the CPU reference dequantizer.
+
+Standard Q5_K uses 176 bytes per 256 values:
+
+    fp16 d, dmin          4
+    packed scale/min     12
+    qh                   32
+    qs                  128
+                       ----
+                        176
+
+SM86_Q5K_SOA expands only the metadata:
+
+    META logical record per block:
+      fp16 d, dmin                        4
+      8 x {u8 scale, u8 min}             16
+                                         --
+                                         20
+
+    QH plane: 32 bytes/block
+    QS plane: 128 bytes/block
+
+Total logical storage is 180 bytes/block, a 2.27% increase before tiny 128-byte plane-alignment padding. The 5-bit quantized weights themselves remain compact.
+
+A Q5_K tensor is stored as:
+
+    data_offset -> META plane, 20-byte stride
+    aux0_offset -> QH plane,   32-byte stride
+    aux1_offset -> QS plane,  128-byte stride
+
+This removes 6-bit scale/min unpacking from the token-time GEMV hot loop and gives QH/QS GPU-friendly power-of-two strides.
+
+## Conversion
+
+Q38PACK v2 is the default:
+
+    python3 tools/gguf_to_q38pack.py model.gguf model.q38pack
+
+Q5_K repacking is vectorized with NumPy:
+
+    python3 -m pip install numpy
+
+To create the old source-preserving format:
+
+    python3 tools/gguf_to_q38pack.py model.gguf model-v1.q38pack --format-version 1
+
+Non-Q5_K tensor types currently remain GGUF_NATIVE in v2. They will only get specialized layouts after independent RTX 3090 benchmarks demonstrate a useful performance/size tradeoff.
