@@ -11,6 +11,15 @@ struct ProjectionErrorStats {
     double max_rel{};
 };
 
+struct GdnArSmokeStats {
+    double output_max_abs{};
+    double output_max_rel{};
+    double state_max_abs{};
+    double state_max_rel{};
+    double kernel_ms{};
+    double state_bandwidth_gbps{};
+};
+
 struct Layer0ProjectionPackStats {
     ProjectionErrorStats qkv;
     ProjectionErrorStats gate;
@@ -58,6 +67,13 @@ public:
     bool run_q5k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_q8k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_sm86_gemv_smoke(const std::byte* repacked_matrix, std::size_t qh_offset, std::size_t qs_offset, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* original_equiv_gbps = nullptr, double* physical_gbps = nullptr);
+    bool run_gdn_ar_smoke(
+        std::uint32_t state_dim = 128,
+        std::uint32_t qk_heads = 16,
+        std::uint32_t value_heads = 48,
+        GdnArSmokeStats* stats = nullptr,
+        std::string* error = nullptr);
+
     bool run_qwen35_layer0_projection_pack(
         const float* norm_weight,
         const std::byte* qkv_matrix,
