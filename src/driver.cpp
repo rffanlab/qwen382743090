@@ -5006,7 +5006,7 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
         CUmodule module{};
         const auto module_rc = module_load_ex(
             &module,
-            kQ5KSm86SoAGemvPtx,
+            kQ5KSm86SoAGemvVecPtx,
             static_cast<unsigned int>(sizeof(jit_options) / sizeof(jit_options[0])),
             jit_options,
             jit_values);
@@ -5019,8 +5019,8 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
 
         CUfunction fn{};
         try {
-            check(handle_, module_get_function(&fn, module, "q38_q5k_sm86_soa_gemv"),
-                  "cuModuleGetFunction(q38_q5k_sm86_soa_gemv)");
+            check(handle_, module_get_function(&fn, module, "q38_q5k_sm86_soa_gemv_vec"),
+                  "cuModuleGetFunction(q38_q5k_sm86_soa_gemv_vec)");
 
             CUdeviceptr arg_meta = meta_ptr;
             CUdeviceptr arg_qh = qh_ptr;
@@ -5033,8 +5033,9 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
                 &arg_meta, &arg_qh, &arg_qs, &arg_x, &arg_y, &arg_cols, &arg_rows
             };
 
-            check(handle_, launch(fn, rows, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
-                  "cuLaunchKernel(q38_q5k_sm86_soa_gemv)");
+            const unsigned int grid_rows4 = (rows + 3u) / 4u;
+            check(handle_, launch(fn, grid_rows4, 1, 1, 128, 1, 1, 0, nullptr, params, nullptr),
+                  "cuLaunchKernel(q38_q5k_sm86_soa_gemv_vec)");
             check(handle_, sync(), "cuCtxSynchronize(SM86 Q5_K correctness)");
             check(handle_, memcpy_dtoh(y.data(), y_ptr, y_bytes), "cuMemcpyDtoH(SM86 Q5_K GEMV)");
 
@@ -5083,8 +5084,8 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
             constexpr int kIters = 50;
             const auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < kIters; ++i) {
-                check(handle_, launch(fn, rows, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
-                      "cuLaunchKernel(q38_q5k_sm86_soa_gemv benchmark)");
+                check(handle_, launch(fn, grid_rows4, 1, 1, 128, 1, 1, 0, nullptr, params, nullptr),
+                      "cuLaunchKernel(q38_q5k_sm86_soa_gemv_vec benchmark)");
             }
             check(handle_, sync(), "cuCtxSynchronize(SM86 Q5_K benchmark)");
             const auto t1 = std::chrono::steady_clock::now();
