@@ -39,6 +39,14 @@ static const char* ggml_type_name(std::uint32_t type) {
     }
 }
 
+static const char* layout_name(q38::TensorLayout layout) {
+    switch (layout) {
+        case q38::TensorLayout::GgufNative: return "GGUF_NATIVE";
+        case q38::TensorLayout::Sm86Q5KSoA: return "SM86_Q5K_SOA";
+        default: return "UNKNOWN";
+    }
+}
+
 static const char* role_name(q38::TensorRole role) {
     switch (role) {
         case q38::TensorRole::TokenEmbedding: return "embedding";
@@ -85,6 +93,8 @@ int main(int argc, char** argv) {
         std::array<std::uint64_t, 9> by_role{};
         std::array<std::uint64_t, 256> type_bytes{};
         std::array<std::uint64_t, 256> type_count{};
+        std::array<std::uint64_t, 8> layout_bytes{};
+        std::array<std::uint64_t, 8> layout_count{};
         const auto& source_tensors = pack.tensors();
         for (std::size_t i = 0; i < plan.tensors().size(); ++i) {
             const auto& t = plan.tensors()[i];
@@ -96,9 +106,15 @@ int main(int argc, char** argv) {
                 type_bytes[type] += t.payload_bytes;
                 type_count[type] += 1;
             }
+            const auto layout = static_cast<std::size_t>(source_tensors[i].layout);
+            if (layout < layout_bytes.size()) {
+                layout_bytes[layout] += t.payload_bytes;
+                layout_count[layout] += 1;
+            }
         }
 
         std::cout << "Q38 GPU placement plan\n";
+        std::cout << "Q38PACK version: " << pack.header().version << "\n";
         std::cout << "GPU page: " << plan.gpu_page_bytes() << " bytes\n";
         std::cout << "tensors: " << plan.tensors().size() << "\n";
         std::cout << std::fixed << std::setprecision(3);
@@ -112,7 +128,14 @@ int main(int argc, char** argv) {
                       << gib(by_role[i]) << " GiB\n";
         }
 
-        std::cout << "tensor types:\n";
+        std::cout << "execution layouts:\n";
+        for (std::size_t i = 0; i < layout_bytes.size(); ++i) {
+            if (!layout_count[i]) continue;
+            std::cout << "  layout[" << i << "/" << layout_name(static_cast<q38::TensorLayout>(i)) << "]: "
+                      << layout_count[i] << " tensors, " << gib(layout_bytes[i]) << " GiB\n";
+        }
+
+        std::cout << "tensor types (physical stored bytes):\n";
         for (std::size_t i = 0; i < type_bytes.size(); ++i) {
             if (!type_count[i]) continue;
             std::cout << "  type[" << i << "/" << ggml_type_name(static_cast<std::uint32_t>(i)) << "]: "
@@ -125,7 +148,9 @@ int main(int argc, char** argv) {
                           << " role=" << role_name(t.role)
                           << " va=0x" << std::hex << t.va_offset << std::dec
                           << " page_off=" << t.page_offset
-                          << " bytes=" << t.payload_bytes << "\n";
+                          << " bytes=" << t.payload_bytes
+                          << " layout=" << layout_name(source_tensors[&t - plan.tensors().data()].layout)
+                          << "\n";
             }
         }
         return 0;
