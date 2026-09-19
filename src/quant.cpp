@@ -209,4 +209,68 @@ void dequantize_q8_k_block_cpu(const std::byte* block, std::array<float, kQ4KVal
     }
 }
 
+void repack_q5_k_sm86_block(const std::byte* source, std::byte* destination) {
+    if (!source || !destination) throw std::invalid_argument("Q5_K SM86 repack received null pointer");
+
+    // Layout:
+    //   0..3   : d, dmin (original fp16 bit-patterns)
+    //   4..19  : 8 x uint16 { low8 = scale, high8 = min }
+    //   20..51 : qh[32] (unchanged)
+    //   52..179: qs[128] (unchanged)
+    std::memcpy(destination + 0, source + 0, 4);
+
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(source + 4);
+    for (int group = 0; group < 8; ++group) {
+        std::uint8_t sc{}, m{};
+        get_scale_min_k4(group, scales, sc, m);
+        const std::uint16_t packed =
+            static_cast<std::uint16_t>(sc) |
+            (static_cast<std::uint16_t>(m) << 8);
+        std::memcpy(destination + 4 + group * 2, &packed, sizeof(packed));
+    }
+
+    std::memcpy(destination + 20, source + 16, 32);
+    std::memcpy(destination + 52, source + 48, 128);
+}
+
+void dequantize_q5_k_sm86_block_cpu(const std::byte* block, std::array<float, kQ4KValuesPerBlock>& out) {
+    if (!block) throw std::invalid_argument("Q5_K SM86 block is null");
+
+    std::uint16_t d_bits{};
+    std::uint16_t dmin_bits{};
+    std::memcpy(&d_bits, block + 0, sizeof(d_bits));
+    std::memcpy(&dmin_bits, block + 2, sizeof(dmin_bits));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    d_bits = __builtin_bswap16(d_bits);
+    dmin_bits = __builtin_bswap16(dmin_bits);
+#endif
+
+    const float d = fp16_to_fp32(d_bits);
+    const float dmin = fp16_to_fp32(dmin_bits);
+    const auto* qh = reinterpret_cast<const std::uint8_t*>(block + 20);
+    const auto* ql = reinterpret_cast<const std::uint8_t*>(block + 52);
+
+    std::size_t out_pos = 0;
+    for (int group = 0; group < 8; ++group) {
+        std::uint16_t sm{};
+        std::memcpy(&sm, block + 4 + group * 2, sizeof(sm));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        sm = __builtin_bswap16(sm);
+#endif
+        const float ds = d * static_cast<float>(sm & 0xffu);
+        const float dm = dmin * static_cast<float>(sm >> 8);
+
+        const int pair = group >> 1;
+        const bool high = (group & 1) != 0;
+        const std::uint8_t high_mask = static_cast<std::uint8_t>(1u << group);
+        const auto* qlp = ql + pair * 32;
+
+        for (int lane = 0; lane < 32; ++lane) {
+            const int low4 = high ? (qlp[lane] >> 4) : (qlp[lane] & 0x0f);
+            const int qv = low4 + ((qh[lane] & high_mask) ? 16 : 0);
+            out[out_pos++] = ds * static_cast<float>(qv) - dm;
+        }
+    }
+}
+
 } // namespace q38
