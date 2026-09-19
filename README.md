@@ -802,3 +802,56 @@ Run:
 The benchmark excludes model upload and PTX JIT time, validates each projection
 against the CPU reference, and reports both individual kernel time and the
 combined projection-pack chain time.
+
+
+### Layer0 projection pack result
+
+The shared-normalized-hidden runtime path is now validated on the real model:
+
+    rmsnorm_ms:               0.0140
+    attn_qkv_ms:              0.0578
+    attn_gate_ms:             0.0382
+    ssm_beta_ms:              0.0113
+    ssm_alpha_ms:             0.0113
+    sum_individual_ms:        0.1326
+    projection_pack_chain_ms: 0.1465
+
+All four projections pass their independent CPU reference checks. The combined
+chain shares one normalized hidden vector and excludes weight upload / PTX JIT.
+
+### Fused Gated DeltaNet decode core
+
+The next native step is the exact single-token recurrent update used by Qwen35 /
+Qwen3.8 recurrent layers.
+
+For the 27B model the real recurrent dimensions are:
+
+    state_dim S_v = 128
+    q/k heads     = 16
+    value heads   = 48
+
+Value head h reuses q/k head h % 16. The recurrent state is stored in the same
+transposed-column layout used by llama.cpp's fused CUDA GDN:
+
+    state[head][column][row]
+    48 * 128 * 128 F32 ~= 3 MiB per recurrent layer
+
+For scalar GDA gate g and beta b, one decode step is:
+
+    G = exp(g)
+    kv[col] = dot(state[:, col], k)
+    delta[col] = (v[col] - G * kv[col]) * beta
+    new_state[:, col] = G * state[:, col] + k * delta[col]
+    out[col] = dot(new_state[:, col], q) / sqrt(128)
+
+The PTX kernel uses four warps per CTA. Each warp owns one state column and each
+lane owns four state rows, matching the upstream CUDA execution structure.
+
+Run:
+
+    ./build/q38-gdn-ar-smoke
+
+The smoke validates all 6144 output values and the complete 48*128*128 updated
+state against an independent CPU implementation, then reports kernel latency and
+state read+write bandwidth. This target is decode-only (n_tokens=1); prefill
+chunking is intentionally deferred.
