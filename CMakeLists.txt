@@ -42,6 +42,9 @@ target_link_libraries(q38-q5k-gemv PRIVATE q38rt)
 add_executable(q38-q5k-q8k-gemv src/q5k_q8k_gemv.cpp)
 target_link_libraries(q38-q5k-q8k-gemv PRIVATE q38rt)
 
+add_executable(q38-q5k-sm86-gemv src/q5k_sm86_gemv.cpp)
+target_link_libraries(q38-q5k-sm86-gemv PRIVATE q38rt)
+
 if(Q38_BUILD_TESTS)
   enable_testing()
   add_executable(q38pack-smoke tests/q38pack_smoke.cpp)
