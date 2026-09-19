@@ -2477,6 +2477,258 @@ DP4A_DONE:
     ret;
 }
 )ptx";
+constexpr const char* kQ5KSm86SoAGemvVecPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+// Vectorized SM86 Q5_K SoA x F32.
+// Four warps per CTA, one output row per warp.
+// Eight 4-lane subgroups map 1:1 to the eight 32-value Q5_K groups.
+// Each lane handles eight weights as two packed groups of four bytes.
+// Scale/min correction is applied only after the 4-lane group reduction.
+.visible .entry q38_q5k_sm86_soa_gemv_vec(
+    .param .u64 p_meta,
+    .param .u64 p_qh,
+    .param .u64 p_qs,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<24>;
+    .reg .b32 %r<128>;
+    .reg .b64 %rd<44>;
+    .reg .f32 %f<48>;
+
+    ld.param.u64 %rd1, [p_meta];
+    ld.param.u64 %rd2, [p_qh];
+    ld.param.u64 %rd3, [p_qs];
+    ld.param.u64 %rd4, [p_x];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 5;       // warp id 0..3
+    and.b32 %r6, %r4, 31;      // lane 0..31
+    shl.b32 %r7, %r3, 2;
+    add.u32 %r7, %r7, %r5;     // output row
+
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra Q5V_DONE;
+
+    shr.u32 %r8, %r6, 2;       // Q5 group 0..7
+    and.b32 %r9, %r6, 3;       // sublane 0..3
+
+    shr.u32 %r10, %r1, 8;      // blocks_per_row
+    mul.lo.u32 %r11, %r7, %r10;
+    mov.u32 %r12, 0;            // block index
+    mov.f32 %f30, 0f00000000;   // valid in subgroup leaders
+
+Q5V_BLOCK_LOOP:
+    setp.ge.u32 %p2, %r12, %r10;
+    @%p2 bra Q5V_BLOCKS_DONE;
+
+    add.u32 %r13, %r11, %r12;   // global block index
+
+    // meta stride 20
+    mul.wide.u32 %rd6, %r13, 20;
+    add.s64 %rd7, %rd1, %rd6;
+
+    // Each sublane owns eight consecutive qh bytes.
+    shl.b32 %r14, %r13, 5;      // block*32
+    shl.b32 %r15, %r9, 3;       // sublane*8
+    add.u32 %r16, %r14, %r15;
+    cvt.u64.u32 %rd8, %r16;
+    add.s64 %rd9, %rd2, %rd8;
+    ld.global.b32 %r40, [%rd9+0];
+    ld.global.b32 %r41, [%rd9+4];
+
+    // qs pair region: 4 x 32-byte regions per block.
+    shr.u32 %r17, %r8, 1;       // pair 0..3
+    shl.b32 %r18, %r13, 7;      // block*128
+    shl.b32 %r19, %r17, 5;      // pair*32
+    add.u32 %r20, %r18, %r19;
+    add.u32 %r20, %r20, %r15;   // + sublane*8
+    cvt.u64.u32 %rd10, %r20;
+    add.s64 %rd11, %rd3, %rd10;
+    ld.global.b32 %r42, [%rd11+0];
+    ld.global.b32 %r43, [%rd11+4];
+
+    // Select low/high nibble for this group.
+    and.b32 %r21, %r8, 1;
+    setp.eq.u32 %p3, %r21, 0;
+    @%p3 and.b32 %r44, %r42, 0x0f0f0f0f;
+    @%p3 and.b32 %r45, %r43, 0x0f0f0f0f;
+    @!%p3 shr.u32 %r44, %r42, 4;
+    @!%p3 shr.u32 %r45, %r43, 4;
+    @!%p3 and.b32 %r44, %r44, 0x0f0f0f0f;
+    @!%p3 and.b32 %r45, %r45, 0x0f0f0f0f;
+
+    // Add Q5 fifth bit into bit4 of every packed byte.
+    mov.u32 %r46, 0x01010101;
+    shl.b32 %r46, %r46, %r8;
+
+    and.b32 %r47, %r40, %r46;
+    and.b32 %r48, %r41, %r46;
+
+    setp.lt.u32 %p4, %r8, 4;
+    @%p4 sub.u32 %r49, 4, %r8;
+    @%p4 shl.b32 %r47, %r47, %r49;
+    @%p4 shl.b32 %r48, %r48, %r49;
+    @!%p4 sub.u32 %r49, %r8, 4;
+    @!%p4 shr.u32 %r47, %r47, %r49;
+    @!%p4 shr.u32 %r48, %r48, %r49;
+
+    or.b32 %r50, %r44, %r47;    // first four q values
+    or.b32 %r51, %r45, %r48;    // next four q values
+
+    // Activation base: block*256 + group*32 + sublane*8.
+    shl.b32 %r52, %r12, 8;
+    shl.b32 %r53, %r8, 5;
+    add.u32 %r54, %r52, %r53;
+    add.u32 %r54, %r54, %r15;
+    mul.wide.u32 %rd12, %r54, 4;
+    add.s64 %rd13, %rd4, %rd12;
+
+    ld.global.v4.f32 {%f1,%f2,%f3,%f4}, [%rd13+0];
+    ld.global.v4.f32 {%f5,%f6,%f7,%f8}, [%rd13+16];
+
+    mov.f32 %f20, 0f00000000;   // sum(q*x)
+    mov.f32 %f21, 0f00000000;   // sum(x)
+
+    // q0
+    and.b32 %r60, %r50, 255;
+    cvt.rn.f32.u32 %f10, %r60;
+    fma.rn.f32 %f20, %f10, %f1, %f20;
+    add.rn.f32 %f21, %f21, %f1;
+
+    // q1
+    shr.u32 %r61, %r50, 8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f11, %r61;
+    fma.rn.f32 %f20, %f11, %f2, %f20;
+    add.rn.f32 %f21, %f21, %f2;
+
+    // q2
+    shr.u32 %r62, %r50, 16;
+    and.b32 %r62, %r62, 255;
+    cvt.rn.f32.u32 %f12, %r62;
+    fma.rn.f32 %f20, %f12, %f3, %f20;
+    add.rn.f32 %f21, %f21, %f3;
+
+    // q3
+    shr.u32 %r63, %r50, 24;
+    cvt.rn.f32.u32 %f13, %r63;
+    fma.rn.f32 %f20, %f13, %f4, %f20;
+    add.rn.f32 %f21, %f21, %f4;
+
+    // q4
+    and.b32 %r64, %r51, 255;
+    cvt.rn.f32.u32 %f14, %r64;
+    fma.rn.f32 %f20, %f14, %f5, %f20;
+    add.rn.f32 %f21, %f21, %f5;
+
+    // q5
+    shr.u32 %r65, %r51, 8;
+    and.b32 %r65, %r65, 255;
+    cvt.rn.f32.u32 %f15, %r65;
+    fma.rn.f32 %f20, %f15, %f6, %f20;
+    add.rn.f32 %f21, %f21, %f6;
+
+    // q6
+    shr.u32 %r66, %r51, 16;
+    and.b32 %r66, %r66, 255;
+    cvt.rn.f32.u32 %f16, %r66;
+    fma.rn.f32 %f20, %f16, %f7, %f20;
+    add.rn.f32 %f21, %f21, %f7;
+
+    // q7
+    shr.u32 %r67, %r51, 24;
+    cvt.rn.f32.u32 %f17, %r67;
+    fma.rn.f32 %f20, %f17, %f8, %f20;
+    add.rn.f32 %f21, %f21, %f8;
+
+    // Reduce q*x and x across the 4-lane group.
+    mov.b32 %r70, %f20;
+    shfl.sync.bfly.b32 %r71, %r70, 2, 31, 0xffffffff;
+    mov.b32 %f22, %r71;
+    add.rn.f32 %f20, %f20, %f22;
+    mov.b32 %r70, %f20;
+    shfl.sync.bfly.b32 %r71, %r70, 1, 31, 0xffffffff;
+    mov.b32 %f22, %r71;
+    add.rn.f32 %f20, %f20, %f22;
+
+    mov.b32 %r72, %f21;
+    shfl.sync.bfly.b32 %r73, %r72, 2, 31, 0xffffffff;
+    mov.b32 %f23, %r73;
+    add.rn.f32 %f21, %f21, %f23;
+    mov.b32 %r72, %f21;
+    shfl.sync.bfly.b32 %r73, %r72, 1, 31, 0xffffffff;
+    mov.b32 %f23, %r73;
+    add.rn.f32 %f21, %f21, %f23;
+
+    setp.ne.u32 %p5, %r9, 0;
+    @%p5 bra Q5V_NEXT_BLOCK;
+
+    // Only subgroup leader applies d*scale and dmin*min.
+    ld.global.b16 %r74, [%rd7+0];
+    ld.global.b16 %r75, [%rd7+2];
+    cvt.f32.f16 %f24, %r74;
+    cvt.f32.f16 %f25, %r75;
+
+    shl.b32 %r76, %r8, 1;
+    cvt.u64.u32 %rd14, %r76;
+    add.s64 %rd15, %rd7, 4;
+    add.s64 %rd16, %rd15, %rd14;
+    ld.global.b16 %r77, [%rd16];
+    and.b32 %r78, %r77, 255;
+    shr.u32 %r79, %r77, 8;
+
+    cvt.rn.f32.u32 %f26, %r78;
+    cvt.rn.f32.u32 %f27, %r79;
+    mul.rn.f32 %f28, %f24, %f26;
+    mul.rn.f32 %f29, %f25, %f27;
+    mul.rn.f32 %f31, %f28, %f20;
+    fma.rn.f32 %f31, -%f29, %f21, %f31;
+    add.rn.f32 %f30, %f30, %f31;
+
+Q5V_NEXT_BLOCK:
+    add.u32 %r12, %r12, 1;
+    bra Q5V_BLOCK_LOOP;
+
+Q5V_BLOCKS_DONE:
+    // f30 is valid in lanes 0,4,8,...28.
+    mov.b32 %r90, %f30;
+    shfl.sync.down.b32 %r91, %r90, 16, 31, 0xffffffff;
+    mov.b32 %f32, %r91;
+    add.rn.f32 %f30, %f30, %f32;
+
+    mov.b32 %r90, %f30;
+    shfl.sync.down.b32 %r91, %r90, 8, 31, 0xffffffff;
+    mov.b32 %f32, %r91;
+    add.rn.f32 %f30, %f30, %f32;
+
+    mov.b32 %r90, %f30;
+    shfl.sync.down.b32 %r91, %r90, 4, 31, 0xffffffff;
+    mov.b32 %f32, %r91;
+    add.rn.f32 %f30, %f30, %f32;
+
+    setp.ne.u32 %p6, %r6, 0;
+    @%p6 bra Q5V_DONE;
+
+    mul.wide.u32 %rd17, %r7, 4;
+    add.s64 %rd18, %rd5, %rd17;
+    st.global.f32 [%rd18], %f30;
+
+Q5V_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ5KSm86SoAGemvPtx = R"ptx(
 .version 7.1
 .target sm_86
