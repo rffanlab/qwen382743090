@@ -35,6 +35,21 @@ public:
     bool run_q5k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_q8k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_sm86_gemv_smoke(const std::byte* repacked_matrix, std::size_t qh_offset, std::size_t qs_offset, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* original_equiv_gbps = nullptr, double* physical_gbps = nullptr);
+    bool run_qwen35_layer0_gate_smoke(
+        const float* norm_weight,
+        const std::byte* repacked_matrix,
+        std::size_t qh_offset,
+        std::size_t qs_offset,
+        std::uint32_t cols,
+        std::uint32_t rows,
+        float rms_eps,
+        std::string* error = nullptr,
+        double* max_abs_error = nullptr,
+        double* max_rel_error = nullptr,
+        double* rmsnorm_ms = nullptr,
+        double* projection_ms = nullptr,
+        double* chain_ms = nullptr,
+        double* projection_original_equiv_gbps = nullptr);
 
 private:
     void* handle_{nullptr};
