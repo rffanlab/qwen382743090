@@ -442,6 +442,177 @@ Q4K_DONE:
 }
 )ptx";
 
+constexpr const char* kQ4KGemvPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_q4k_gemv_f32(
+    .param .u64 p_weights,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<12>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<16>;
+
+    ld.param.u64 %rd1, [p_weights];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    setp.ge.u32 %p1, %r3, %r2;
+    @%p1 bra Q4G_DONE;
+    setp.ge.u32 %p2, %r4, 32;
+    @%p2 bra Q4G_DONE;
+
+    shr.u32 %r5, %r1, 8;       // blocks_per_row = cols/256
+    mul.lo.u32 %r6, %r5, 144;  // bytes_per_row
+    mul.wide.u32 %rd4, %r3, %r6;
+    add.s64 %rd5, %rd1, %rd4;
+
+    mov.u32 %r7, 0;
+    mov.f32 %f10, 0f00000000;
+
+Q4G_BLOCK_LOOP:
+    setp.ge.u32 %p3, %r7, %r5;
+    @%p3 bra Q4G_BLOCKS_DONE;
+
+    mul.wide.u32 %rd6, %r7, 144;
+    add.s64 %rd7, %rd5, %rd6;
+
+    ld.global.b16 %r40, [%rd7+0];
+    ld.global.b16 %r41, [%rd7+2];
+    cvt.f32.f16 %f1, %r40;
+    cvt.f32.f16 %f2, %r41;
+
+    mov.u32 %r8, 0;
+
+Q4G_GROUP_LOOP:
+    setp.ge.u32 %p4, %r8, 8;
+    @%p4 bra Q4G_GROUPS_DONE;
+
+    add.s64 %rd8, %rd7, 4;
+    setp.lt.u32 %p5, %r8, 4;
+    @%p5 bra Q4G_SCALE_LOW;
+
+    add.u32 %r9, %r8, 4;
+    cvt.u64.u32 %rd9, %r9;
+    add.s64 %rd10, %rd8, %rd9;
+    ld.global.u8 %r10, [%rd10];
+
+    sub.u32 %r11, %r8, 4;
+    cvt.u64.u32 %rd11, %r11;
+    add.s64 %rd12, %rd8, %rd11;
+    ld.global.u8 %r12, [%rd12];
+
+    cvt.u64.u32 %rd13, %r8;
+    add.s64 %rd14, %rd8, %rd13;
+    ld.global.u8 %r13, [%rd14];
+
+    and.b32 %r14, %r10, 15;
+    shr.u32 %r15, %r12, 6;
+    shl.b32 %r15, %r15, 4;
+    or.b32 %r16, %r14, %r15;
+
+    shr.u32 %r17, %r10, 4;
+    shr.u32 %r18, %r13, 6;
+    shl.b32 %r18, %r18, 4;
+    or.b32 %r19, %r17, %r18;
+    bra Q4G_SCALE_READY;
+
+Q4G_SCALE_LOW:
+    cvt.u64.u32 %rd9, %r8;
+    add.s64 %rd10, %rd8, %rd9;
+    ld.global.u8 %r10, [%rd10];
+    and.b32 %r16, %r10, 63;
+
+    add.u32 %r11, %r8, 4;
+    cvt.u64.u32 %rd11, %r11;
+    add.s64 %rd12, %rd8, %rd11;
+    ld.global.u8 %r12, [%rd12];
+    and.b32 %r19, %r12, 63;
+
+Q4G_SCALE_READY:
+    cvt.rn.f32.u32 %f3, %r16;
+    cvt.rn.f32.u32 %f4, %r19;
+    mul.rn.f32 %f5, %f1, %f3;
+    mul.rn.f32 %f6, %f2, %f4;
+
+    // One qs byte serves low/high adjacent groups. Load on even, reuse on odd.
+    shr.u32 %r20, %r8, 1;
+    shl.b32 %r20, %r20, 5;
+    add.u32 %r20, %r20, %r4;
+    cvt.u64.u32 %rd15, %r20;
+    add.s64 %rd16, %rd7, 16;
+    add.s64 %rd17, %rd16, %rd15;
+
+    and.b32 %r21, %r8, 1;
+    setp.eq.u32 %p6, %r21, 0;
+    @%p6 ld.global.u8 %r22, [%rd17];
+    @%p6 and.b32 %r23, %r22, 15;
+    @!%p6 shr.u32 %r23, %r22, 4;
+
+    cvt.rn.f32.u32 %f7, %r23;
+    mul.rn.f32 %f8, %f5, %f7;
+    sub.rn.f32 %f9, %f8, %f6;
+
+    shl.b32 %r24, %r7, 8;
+    shl.b32 %r25, %r8, 5;
+    add.u32 %r26, %r24, %r25;
+    add.u32 %r26, %r26, %r4;
+    mul.wide.u32 %rd18, %r26, 4;
+    add.s64 %rd19, %rd2, %rd18;
+    ld.global.f32 %f11, [%rd19];
+
+    fma.rn.f32 %f10, %f9, %f11, %f10;
+
+    add.u32 %r8, %r8, 1;
+    bra Q4G_GROUP_LOOP;
+
+Q4G_GROUPS_DONE:
+    add.u32 %r7, %r7, 1;
+    bra Q4G_BLOCK_LOOP;
+
+Q4G_BLOCKS_DONE:
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 16, 31, 0xffffffff;
+    mov.b32 %f12, %r31;
+    add.rn.f32 %f10, %f10, %f12;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 8, 31, 0xffffffff;
+    mov.b32 %f12, %r31;
+    add.rn.f32 %f10, %f10, %f12;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 4, 31, 0xffffffff;
+    mov.b32 %f12, %r31;
+    add.rn.f32 %f10, %f10, %f12;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 2, 31, 0xffffffff;
+    mov.b32 %f12, %r31;
+    add.rn.f32 %f10, %f10, %f12;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 1, 31, 0xffffffff;
+    mov.b32 %f12, %r31;
+    add.rn.f32 %f10, %f10, %f12;
+
+    setp.eq.u32 %p7, %r4, 0;
+    mul.wide.u32 %rd20, %r3, 4;
+    add.s64 %rd21, %rd3, %rd20;
+    @%p7 st.global.f32 [%rd21], %f10;
+
+Q4G_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ5KDequantPtx = R"ptx(
 .version 7.1
 .target sm_86
