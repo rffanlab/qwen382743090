@@ -12,6 +12,7 @@ add_library(q38rt STATIC
     src/driver.cpp
     src/runtime.cpp
     src/placement.cpp
+    src/quant.cpp
 )
 target_include_directories(q38rt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(q38rt PRIVATE -Wall -Wextra -Wpedantic)
@@ -28,6 +29,9 @@ target_link_libraries(q38-plan PRIVATE q38rt)
 
 add_executable(q38-rmsnorm-smoke src/rmsnorm_smoke.cpp)
 target_link_libraries(q38-rmsnorm-smoke PRIVATE q38rt)
+
+add_executable(q38-q4k-smoke src/q4k_smoke.cpp)
+target_link_libraries(q38-q4k-smoke PRIVATE q38rt)
 
 if(Q38_BUILD_TESTS)
   enable_testing()
