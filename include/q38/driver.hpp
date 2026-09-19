@@ -31,6 +31,7 @@ public:
     bool run_sm86_smoke(std::string* error = nullptr);
     bool run_rmsnorm_smoke(std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr);
     bool run_q4k_dequant_smoke(const std::byte* block, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr);
+    bool run_q5k_dequant_smoke(const std::byte* block, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr);
 
 private:
     void* handle_{nullptr};
