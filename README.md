@@ -254,3 +254,33 @@ Run both retained F32 and new Q8_K paths back-to-back:
     ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack && ./build/q38-q5k-q8k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
 
 The Q8_K benchmark prints `activation_quantization_in_timing: no` explicitly. GPU activation quantization will only be integrated after the packed integer dot path proves worthwhile.
+
+
+### Rejected Q8_K mapping: 8 warps per row
+
+The first Q5_K x Q8_K kernel was numerically correct but slow:
+
+    F32 v2: 0.0864 ms / 250.3869 GB/s
+    Q8_K 8-warp: 0.2338 ms / 92.4999 GB/s
+
+The problem was execution geometry, not Q8_K math: 256 threads were launched for every output row, inflating scheduling/register work while each warp only handled one 32-value group.
+
+### DP4A four-row mapping
+
+The replacement keeps one 32-thread warp as the scheduling unit but computes four output rows at once:
+
+    warp
+      subgroup lanes  0..7   -> row 0
+      subgroup lanes  8..15  -> row 1
+      subgroup lanes 16..23  -> row 2
+      subgroup lanes 24..31  -> row 3
+
+For each 32-value Q5_K group, every 8-lane subgroup packs four Q5 bytes and loads four signed Q8 bytes per lane. It then uses:
+
+    dp4a.u32.s32
+
+so one lane computes four integer products per instruction. XOR warp shuffles reduce each independent 8-lane subgroup without crossing row boundaries. Subgroup leaders apply Q5 scale/min and Q8_K bsums correction and write one row result directly, with no global atomics.
+
+Run the retained F32 baseline and the new DP4A path back-to-back:
+
+    ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack && ./build/q38-q5k-q8k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
