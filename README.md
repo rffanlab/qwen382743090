@@ -229,3 +229,28 @@ v3 在保持相同 packed Q5_K × F32 数学路径的前提下进一步减少 wa
 重新执行相同 GEMV benchmark，可直接和 250.7441 GB/s 对比：
 
     ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+
+### Rejected experiment: lane-0 metadata broadcast
+
+RTX 3090 real measurement showed the v3 metadata-broadcast experiment was a strong regression:
+
+    v2: 0.0863 ms / 250.7441 GB/s
+    v3: 0.2576 ms / 83.9549 GB/s
+
+The change was reverted. On GA102, same-address warp loads for the tiny Q5_K metadata are already handled efficiently enough by the memory hierarchy; serializing those loads through lane 0 costs far more than it saves. The retained F32 baseline is v2.
+
+### Q5_K x Q8_K integer-dot experiment
+
+The next path pairs Q5_K weights with the standard GGML Q8_K activation format:
+
+    block_q8_K = float d + int8 qs[256] + int16 bsums[16]
+    size = 292 bytes / 256 activations
+
+For the first experiment, activation quantization is performed on the CPU before timing so GEMV kernel throughput can be measured independently. The GPU uses one CTA per output row and eight warps, one warp per 32-value Q5_K group. Each lane multiplies one Q5 integer with one signed Q8 integer; the warp reduces the integer dot and lane 0 applies scale/min correction using Q8_K bsums.
+
+Run both retained F32 and new Q8_K paths back-to-back:
+
+    ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack && ./build/q38-q5k-q8k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+The Q8_K benchmark prints `activation_quantization_in_timing: no` explicitly. GPU activation quantization will only be integrated after the packed integer dot path proves worthwhile.
