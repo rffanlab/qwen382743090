@@ -888,6 +888,187 @@ IQG_DONE:
 }
 )ptx";
 
+
+constexpr const char* kIQ4XSGemv4WarpPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_iq4xs_gemv_f32_4warp(
+    .param .u64 p_weights,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<16>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<16>;
+
+    ld.param.u64 %rd1, [p_weights];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    // Four warps per CTA, one independent output row per warp.
+    // SM86 is limited to 16 resident CTAs but 48 resident warps, so
+    // 1-warp CTAs can cap occupancy at 16/48 before register limits.
+    mov.u32 %r32, %ctaid.x;
+    mov.u32 %r33, %tid.x;
+    shr.u32 %r34, %r33, 5;      // warp id 0..3
+    and.b32 %r4, %r33, 31;      // lane 0..31
+    shl.b32 %r3, %r32, 2;
+    add.u32 %r3, %r3, %r34;     // row = cta*4 + warp
+    setp.ge.u32 %p1, %r3, %r2;
+    @%p1 bra IQG_DONE;
+
+    // 256 weights per 136-byte IQ4_XS block.
+    shr.u32 %r5, %r1, 8;
+    mul.lo.u32 %r6, %r5, 136;
+    mul.wide.u32 %rd4, %r3, %r6;
+    add.s64 %rd5, %rd1, %rd4;
+
+    // Packed codebook bytes:
+    // [-127,-104,-83,-65], [-49,-35,-22,-10], [1,13,25,38], [53,69,89,113]
+    mov.u32 %r50, 0xBFAD9881;
+    mov.u32 %r51, 0xF6EADDCF;
+    mov.u32 %r52, 0x26190D01;
+    mov.u32 %r53, 0x71594535;
+
+    mov.u32 %r7, 0;
+    mov.f32 %f10, 0f00000000;
+
+IQG_BLOCK_LOOP:
+    setp.ge.u32 %p3, %r7, %r5;
+    @%p3 bra IQG_BLOCKS_DONE;
+
+    mul.wide.u32 %rd6, %r7, 136;
+    add.s64 %rd7, %rd5, %rd6;
+
+    // Cache d and scale high bits once per block.
+    ld.global.b16 %r40, [%rd7+0];
+    ld.global.b16 %r41, [%rd7+2];
+    cvt.f32.f16 %f1, %r40;
+
+    mov.u32 %r8, 0;
+
+IQG_GROUP_LOOP:
+    setp.ge.u32 %p4, %r8, 8;
+    @%p4 bra IQG_GROUPS_DONE;
+
+    // 6-bit scale = 4 low bits from scales_l + 2 high bits from scales_h.
+    shr.u32 %r9, %r8, 1;
+    cvt.u64.u32 %rd8, %r9;
+    add.s64 %rd9, %rd7, 4;
+    add.s64 %rd10, %rd9, %rd8;
+
+    and.b32 %r10, %r8, 1;
+    setp.eq.u32 %p5, %r10, 0;
+    @%p5 ld.global.u8 %r42, [%rd10];
+
+    shl.b32 %r11, %r10, 2;
+    shr.u32 %r12, %r42, %r11;
+    and.b32 %r12, %r12, 15;
+
+    shl.b32 %r13, %r8, 1;
+    shr.u32 %r14, %r41, %r13;
+    and.b32 %r14, %r14, 3;
+    shl.b32 %r14, %r14, 4;
+    or.b32 %r15, %r12, %r14;
+    sub.s32 %r16, %r15, 32;
+
+    cvt.rn.f32.s32 %f2, %r16;
+    mul.rn.f32 %f3, %f1, %f2;
+
+    // One byte encodes two weights in each 32-value group.
+    and.b32 %r17, %r4, 15;
+    shl.b32 %r18, %r8, 4;
+    add.u32 %r18, %r18, %r17;
+    cvt.u64.u32 %rd11, %r18;
+    add.s64 %rd12, %rd7, 8;
+    add.s64 %rd13, %rd12, %rd11;
+    ld.global.u8 %r19, [%rd13];
+
+    setp.lt.u32 %p6, %r4, 16;
+    @%p6 and.b32 %r20, %r19, 15;
+    @!%p6 shr.u32 %r20, %r19, 4;
+
+    // Register-only IQ4 nonlinear table lookup.
+    shr.u32 %r21, %r20, 2;
+    mov.u32 %r22, %r50;
+    setp.eq.u32 %p7, %r21, 1;
+    @%p7 mov.u32 %r22, %r51;
+    setp.eq.u32 %p8, %r21, 2;
+    @%p8 mov.u32 %r22, %r52;
+    setp.eq.u32 %p9, %r21, 3;
+    @%p9 mov.u32 %r22, %r53;
+
+    and.b32 %r23, %r20, 3;
+    shl.b32 %r23, %r23, 3;
+    shr.u32 %r24, %r22, %r23;
+    and.b32 %r24, %r24, 255;
+    shl.b32 %r24, %r24, 24;
+    shr.s32 %r24, %r24, 24;
+
+    cvt.rn.f32.s32 %f4, %r24;
+    mul.rn.f32 %f5, %f3, %f4;
+
+    shl.b32 %r25, %r7, 8;
+    shl.b32 %r26, %r8, 5;
+    add.u32 %r27, %r25, %r26;
+    add.u32 %r27, %r27, %r4;
+    mul.wide.u32 %rd14, %r27, 4;
+    add.s64 %rd15, %rd2, %rd14;
+    ld.global.f32 %f6, [%rd15];
+
+    fma.rn.f32 %f10, %f5, %f6, %f10;
+
+    add.u32 %r8, %r8, 1;
+    bra IQG_GROUP_LOOP;
+
+IQG_GROUPS_DONE:
+    add.u32 %r7, %r7, 1;
+    bra IQG_BLOCK_LOOP;
+
+IQG_BLOCKS_DONE:
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 16, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 8, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 4, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 2, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 1, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+
+    setp.eq.u32 %p10, %r4, 0;
+    mul.wide.u32 %rd16, %r3, 4;
+    add.s64 %rd17, %rd3, %rd16;
+    @%p10 st.global.f32 [%rd17], %f10;
+
+IQG_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kIQ4XSSm86SoAGemvPtx = R"ptx(
 .version 7.1
 .target sm_86
