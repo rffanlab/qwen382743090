@@ -313,4 +313,71 @@ void dequantize_iq4_xs_block_cpu(const std::byte* block, std::array<float, kQ4KV
     }
 }
 
+void repack_iq4_xs_sm86_block(const std::byte* source, std::byte* destination) {
+    if (!source || !destination) {
+        throw std::invalid_argument("IQ4_XS SM86 repack received null pointer");
+    }
+
+    // Logical compact block used by CPU validation:
+    //   0..1   : d (original fp16 bit-pattern)
+    //   2..9   : 8 x int8 (ls - 32)
+    //   10..137: qs[128] unchanged
+    std::memcpy(destination + 0, source + 0, 2);
+
+    std::uint16_t scales_h{};
+    std::memcpy(&scales_h, source + 2, sizeof(scales_h));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    scales_h = __builtin_bswap16(scales_h);
+#endif
+    const auto* scales_l =
+        reinterpret_cast<const std::uint8_t*>(source + 4);
+
+    for (int group = 0; group < 8; ++group) {
+        const int low4 =
+            (scales_l[group / 2] >> (4 * (group % 2))) & 0x0f;
+        const int high2 = (scales_h >> (2 * group)) & 0x03;
+        const int scale = (low4 | (high2 << 4)) - 32;
+        const std::int8_t signed_scale = static_cast<std::int8_t>(scale);
+        std::memcpy(destination + 2 + group, &signed_scale, 1);
+    }
+
+    std::memcpy(destination + 10, source + 8, 128);
+}
+
+void dequantize_iq4_xs_sm86_block_cpu(
+    const std::byte* block,
+    std::array<float, kQ4KValuesPerBlock>& out) {
+    if (!block) throw std::invalid_argument("IQ4_XS SM86 block is null");
+
+    static constexpr std::array<std::int8_t, 16> kValues{
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113,
+    };
+
+    std::uint16_t d_bits{};
+    std::memcpy(&d_bits, block + 0, sizeof(d_bits));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    d_bits = __builtin_bswap16(d_bits);
+#endif
+    const float d = fp16_to_fp32(d_bits);
+
+    const auto* scales =
+        reinterpret_cast<const std::int8_t*>(block + 2);
+    const auto* qs =
+        reinterpret_cast<const std::uint8_t*>(block + 10);
+
+    std::size_t out_pos = 0;
+    for (int group = 0; group < 8; ++group) {
+        const float dl = d * static_cast<float>(scales[group]);
+        const auto* q = qs + group * 16;
+        for (int j = 0; j < 16; ++j) {
+            out[out_pos + j] =
+                dl * static_cast<float>(kValues[q[j] & 0x0f]);
+            out[out_pos + 16 + j] =
+                dl * static_cast<float>(kValues[q[j] >> 4]);
+        }
+        out_pos += 32;
+    }
+}
+
 } // namespace q38
