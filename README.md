@@ -600,3 +600,40 @@ Compare against the native F32 baseline:
 The Q8_1 benchmark prints `activation_quantization_in_timing: no`. GPU Q8_1
 quantization / RMSNorm fusion will only be implemented if the packed integer
 GEMV materially beats the 199.6 GB/s F32 baseline.
+
+
+### Four-warps-per-CTA IQ4_XS experiment
+
+The IQ4_XS x Q8_1 DP4A experiment was numerically correct but slower than the F32 path:
+
+    IQ4_XS x F32:
+      0.2373 ms
+      199.5655 GB/s
+
+    IQ4_XS x Q8_1 DP4A:
+      0.3077 ms
+      153.8915 GB/s
+
+Activation quantization was excluded from the Q8_1 timing, so the packed integer-dot path is rejected for this kernel mapping.
+
+The next experiment keeps native IQ4_XS weights, F32 activation, codebook arithmetic and numerical path unchanged. Only launch geometry changes.
+
+SM86 supports at most 16 resident thread blocks per SM but up to 48 resident warps per SM. A one-warp CTA can therefore hit the block-count limit at only 16 resident warps before register/shared-memory limits are considered.
+
+The new mapping is:
+
+    one CTA = 128 threads = four warps
+    warp 0 -> output row CTA*4 + 0
+    warp 1 -> output row CTA*4 + 1
+    warp 2 -> output row CTA*4 + 2
+    warp 3 -> output row CTA*4 + 3
+
+Each warp remains row-local, so weight-access coalescing is unchanged from the original kernel.
+
+Run:
+
+    ./build/q38-iq4xs-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+The output reports:
+
+    kernel_mapping: 4warps_per_cta_1row_per_warp
