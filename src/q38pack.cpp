@@ -110,7 +110,8 @@ void PackFile::parse() {
     header_.source_file_size = read_le<std::uint64_t>(p + 96);
     header_.source_data_offset = read_le<std::uint64_t>(p + 104);
 
-    if (header_.version != kPackVersion || header_.header_bytes != kPackHeaderBytes) {
+    if (header_.version < kPackMinVersion || header_.version > kPackVersion ||
+        header_.header_bytes != kPackHeaderBytes) {
         throw std::runtime_error("q38pack: unsupported version");
     }
     if (header_.directory_bytes != static_cast<std::uint64_t>(header_.tensor_count) * kTensorEntryBytes) {
@@ -144,8 +145,26 @@ void PackFile::parse() {
         t.source_offset = read_le<std::uint64_t>(e + 216);
         t.role = static_cast<TensorRole>(read_le<std::uint32_t>(e + 224));
         t.flags = read_le<std::uint32_t>(e + 228);
+        if (header_.version >= 2) {
+            t.layout = static_cast<TensorLayout>(read_le<std::uint32_t>(e + 232));
+            t.layout_flags = read_le<std::uint32_t>(e + 236);
+            t.aux0_offset = read_le<std::uint64_t>(e + 240);
+            t.aux1_offset = read_le<std::uint64_t>(e + 248);
+        }
+
         ensure_range(t.data_offset, t.stored_bytes, file_size_, "tensor");
         if (t.data_offset < header_.data_offset) throw std::runtime_error("q38pack: tensor points outside data area");
+
+        if (t.layout == TensorLayout::Sm86Q5KSoA) {
+            const auto tensor_end = t.data_offset + t.stored_bytes;
+            if (!(t.data_offset <= t.aux0_offset &&
+                  t.aux0_offset <= t.aux1_offset &&
+                  t.aux1_offset < tensor_end)) {
+                throw std::runtime_error("q38pack: invalid SM86 Q5_K plane offsets");
+            }
+        } else if (t.layout != TensorLayout::GgufNative) {
+            throw std::runtime_error("q38pack: unknown tensor execution layout");
+        }
         tensors_.push_back(std::move(t));
     }
 }
@@ -159,6 +178,16 @@ const std::byte* PackFile::tensor_data(const TensorRecord& tensor) const {
     if (!mapped_) throw std::runtime_error("q38pack: no file open");
     ensure_range(tensor.data_offset, tensor.stored_bytes, file_size_, "tensor");
     return static_cast<const std::byte*>(mapped_) + tensor.data_offset;
+}
+
+const std::byte* PackFile::tensor_aux_data(const TensorRecord& tensor, int index) const {
+    if (!mapped_) throw std::runtime_error("q38pack: no file open");
+    const std::uint64_t off = index == 0 ? tensor.aux0_offset :
+                              index == 1 ? tensor.aux1_offset : 0;
+    if (index < 0 || index > 1) throw std::invalid_argument("q38pack: aux plane index must be 0 or 1");
+    if (off == 0) return nullptr;
+    ensure_range(off, 1, file_size_, "tensor aux plane");
+    return static_cast<const std::byte*>(mapped_) + off;
 }
 
 } // namespace q38
