@@ -616,13 +616,11 @@ BLOCK_LOOP:
     mul.wide.u32 %rd6, %r6, 176;
     add.s64 %rd7, %rd5, %rd6;
 
-    // d / dmin are identical for the whole warp. Lane 0 performs the
-    // two global loads and broadcasts raw f16 bit patterns to all lanes.
-    setp.eq.u32 %p9, %r4, 0;
-    @%p9 ld.global.b16 %r40, [%rd7+0];
-    @%p9 ld.global.b16 %r41, [%rd7+2];
-    shfl.sync.idx.b32 %r40, %r40, 0, 31, 0xffffffff;
-    shfl.sync.idx.b32 %r41, %r41, 0, 31, 0xffffffff;
+    // Identical-address warp loads are efficiently serviced by Ampere's
+    // memory hierarchy. Keep every lane active; lane-0 serialization was
+    // measured to regress bandwidth badly on RTX 3090.
+    ld.global.b16 %r40, [%rd7+0];
+    ld.global.b16 %r41, [%rd7+2];
     cvt.f32.f16 %f1, %r40;
     cvt.f32.f16 %f2, %r41;
 
@@ -639,10 +637,7 @@ GROUP_LOOP:
     setp.ge.u32 %p4, %r8, 8;
     @%p4 bra GROUPS_DONE;
 
-    // Decode 6-bit scale/min only in lane 0. All lanes in the warp use
-    // the same metadata for a given 32-value group, so broadcast afterward.
-    setp.ne.u32 %p10, %r4, 0;
-    @%p10 bra GEMV_SCALE_BROADCAST;
+    // Decode 6-bit scale/min for this 32-value group.
     add.s64 %rd8, %rd7, 4;
     setp.lt.u32 %p5, %r8, 4;
     @%p5 bra GEMV_SCALE_LOW;
@@ -685,9 +680,6 @@ GEMV_SCALE_LOW:
     and.b32 %r19, %r12, 63;
 
 GEMV_SCALE_READY:
-GEMV_SCALE_BROADCAST:
-    shfl.sync.idx.b32 %r16, %r16, 0, 31, 0xffffffff;
-    shfl.sync.idx.b32 %r19, %r19, 0, 31, 0xffffffff;
     cvt.rn.f32.u32 %f3, %r16;
     cvt.rn.f32.u32 %f4, %r19;
     mul.rn.f32 %f5, %f1, %f3;
