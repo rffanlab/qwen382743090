@@ -2,8 +2,10 @@
 #include "q38/q38pack.hpp"
 #include "q38/quant.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
