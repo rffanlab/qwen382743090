@@ -997,7 +997,7 @@ QKN_DONE:
 
     // softplus(alpha + dt), stable branch for large positive values.
     add.rn.f32 %f10, %f4, %f5;
-    setp.gt.f32 %p2, %f10, 20f;
+    setp.gt.f32 %p2, %f10, 0f41A00000;
     @%p2 mov.f32 %f14, %f10;
     @%p2 bra BG_SP_DONE;
 
