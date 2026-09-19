@@ -6032,6 +6032,1614 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
 
 
 
+bool NvidiaDriver::run_qwen35_layer0_full(
+    const float* norm_weight,
+    const std::byte* qkv_matrix,
+    std::size_t qkv_qh_offset,
+    std::size_t qkv_qs_offset,
+    const std::byte* z_matrix,
+    std::size_t z_qh_offset,
+    std::size_t z_qs_offset,
+    const std::byte* beta_matrix,
+    const std::byte* alpha_matrix,
+    const float* conv_weight,
+    const float* dt_bias,
+    const float* ssm_a,
+    const float* ssm_norm_weight,
+    const std::byte* ssm_out_matrix,
+    std::size_t ssm_out_qh_offset,
+    std::size_t ssm_out_qs_offset,
+    const float* post_norm_weight,
+    const std::byte* ffn_gate_matrix,
+    const std::byte* ffn_up_matrix,
+    std::size_t ffn_up_qh_offset,
+    std::size_t ffn_up_qs_offset,
+    const std::byte* ffn_down_matrix,
+    std::size_t ffn_down_qh_offset,
+    std::size_t ffn_down_qs_offset,
+    float rms_eps,
+    Layer0FullStats* stats,
+    std::string* error) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error(
+                "q38 layer0 recurrent front requires sm_86; detected sm_" +
+                std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (!norm_weight || !qkv_matrix || !z_matrix ||
+            !beta_matrix || !alpha_matrix ||
+            !conv_weight || !dt_bias || !ssm_a ||
+            !ssm_norm_weight || !ssm_out_matrix ||
+            !post_norm_weight || !ffn_gate_matrix ||
+            !ffn_up_matrix || !ffn_down_matrix) {
+            throw std::invalid_argument(
+                "layer0 full received null model tensor");
+        }
+
+        constexpr std::uint32_t kCols = 5120;
+        constexpr std::uint32_t kQkvRows = 10240;
+        constexpr std::uint32_t kZRows = 6144;
+        constexpr std::uint32_t kSmallRows = 48;
+        constexpr std::uint32_t kHeadDim = 128;
+        constexpr std::uint32_t kQkHeads = 16;
+        constexpr std::uint32_t kValueHeads = 48;
+        constexpr std::uint32_t kFfnDim = 17408;
+        constexpr std::uint32_t kKeyDim = kQkHeads * kHeadDim;
+        constexpr std::uint32_t kValueDim = kValueHeads * kHeadDim;
+        constexpr std::uint32_t kConvStateSteps = 3;
+        constexpr std::size_t kGdnStateValues =
+            static_cast<std::size_t>(kValueHeads) * kHeadDim * kHeadDim;
+
+        const std::size_t q5_blocks_per_row = kCols / kQ4KValuesPerBlock;
+
+        const std::size_t qkv_blocks =
+            static_cast<std::size_t>(kQkvRows) * q5_blocks_per_row;
+        const std::size_t qkv_meta_bytes = qkv_blocks * 20;
+        const std::size_t qkv_qh_bytes = qkv_blocks * 32;
+        const std::size_t qkv_qs_bytes = qkv_blocks * 128;
+        if (qkv_qh_offset < qkv_meta_bytes ||
+            qkv_qs_offset < qkv_qh_offset + qkv_qh_bytes) {
+            throw std::invalid_argument("invalid qkv Q5_K plane offsets");
+        }
+        const std::size_t qkv_bytes = qkv_qs_offset + qkv_qs_bytes;
+
+        const std::size_t z_blocks =
+            static_cast<std::size_t>(kZRows) * q5_blocks_per_row;
+        const std::size_t z_meta_bytes = z_blocks * 20;
+        const std::size_t z_qh_bytes = z_blocks * 32;
+        const std::size_t z_qs_bytes = z_blocks * 128;
+        if (z_qh_offset < z_meta_bytes ||
+            z_qs_offset < z_qh_offset + z_qh_bytes) {
+            throw std::invalid_argument("invalid z Q5_K plane offsets");
+        }
+        const std::size_t z_bytes = z_qs_offset + z_qs_bytes;
+
+        const std::size_t ssm_out_blocks_per_row =
+            kValueDim / kQ4KValuesPerBlock;
+        const std::size_t ssm_out_blocks =
+            static_cast<std::size_t>(kCols) * ssm_out_blocks_per_row;
+        const std::size_t ssm_out_meta_bytes = ssm_out_blocks * 20;
+        const std::size_t ssm_out_qh_bytes = ssm_out_blocks * 32;
+        const std::size_t ssm_out_qs_bytes = ssm_out_blocks * 128;
+        if (ssm_out_qh_offset < ssm_out_meta_bytes ||
+            ssm_out_qs_offset < ssm_out_qh_offset + ssm_out_qh_bytes) {
+            throw std::invalid_argument("invalid ssm_out Q5_K plane offsets");
+        }
+        const std::size_t ssm_out_bytes =
+            ssm_out_qs_offset + ssm_out_qs_bytes;
+        const std::size_t ssm_norm_bytes =
+            static_cast<std::size_t>(kHeadDim) * sizeof(float);
+        const std::size_t post_norm_bytes =
+            static_cast<std::size_t>(kCols) * sizeof(float);
+
+        const std::size_t ffn_gate_blocks_per_row =
+            kCols / kQ4KValuesPerBlock;
+        const std::size_t ffn_gate_bytes =
+            static_cast<std::size_t>(kFfnDim) *
+            ffn_gate_blocks_per_row * kIQ4XSBytesPerBlock;
+
+        const std::size_t ffn_up_blocks_per_row =
+            kCols / kQ4KValuesPerBlock;
+        const std::size_t ffn_up_blocks =
+            static_cast<std::size_t>(kFfnDim) *
+            ffn_up_blocks_per_row;
+        const std::size_t ffn_up_meta_bytes = ffn_up_blocks * 20;
+        const std::size_t ffn_up_qh_bytes = ffn_up_blocks * 32;
+        const std::size_t ffn_up_qs_bytes = ffn_up_blocks * 128;
+        if (ffn_up_qh_offset < ffn_up_meta_bytes ||
+            ffn_up_qs_offset < ffn_up_qh_offset + ffn_up_qh_bytes) {
+            throw std::invalid_argument("invalid ffn_up Q5_K plane offsets");
+        }
+        const std::size_t ffn_up_bytes =
+            ffn_up_qs_offset + ffn_up_qs_bytes;
+
+        const std::size_t ffn_down_blocks_per_row =
+            kFfnDim / kQ4KValuesPerBlock;
+        const std::size_t ffn_down_blocks =
+            static_cast<std::size_t>(kCols) *
+            ffn_down_blocks_per_row;
+        const std::size_t ffn_down_meta_bytes = ffn_down_blocks * 20;
+        const std::size_t ffn_down_qh_bytes = ffn_down_blocks * 32;
+        const std::size_t ffn_down_qs_bytes = ffn_down_blocks * 128;
+        if (ffn_down_qh_offset < ffn_down_meta_bytes ||
+            ffn_down_qs_offset < ffn_down_qh_offset + ffn_down_qh_bytes) {
+            throw std::invalid_argument("invalid ffn_down Q5_K plane offsets");
+        }
+        const std::size_t ffn_down_bytes =
+            ffn_down_qs_offset + ffn_down_qs_bytes;
+
+        const std::size_t q4_blocks_per_row =
+            kCols / kQ4KValuesPerBlock;
+        const std::size_t small_matrix_bytes =
+            static_cast<std::size_t>(kSmallRows) *
+            q4_blocks_per_row * kQ4KBytesPerBlock;
+
+        const std::size_t hidden_bytes =
+            static_cast<std::size_t>(kCols) * sizeof(float);
+        const std::size_t ffn_bytes =
+            static_cast<std::size_t>(kFfnDim) * sizeof(float);
+        const std::size_t qkv_out_bytes =
+            static_cast<std::size_t>(kQkvRows) * sizeof(float);
+        const std::size_t z_out_bytes =
+            static_cast<std::size_t>(kZRows) * sizeof(float);
+        const std::size_t small_bytes =
+            static_cast<std::size_t>(kSmallRows) * sizeof(float);
+        const std::size_t conv_weight_bytes =
+            static_cast<std::size_t>(4) * kQkvRows * sizeof(float);
+        const std::size_t conv_state_bytes =
+            static_cast<std::size_t>(kConvStateSteps) *
+            kQkvRows * sizeof(float);
+        const std::size_t qk_bytes =
+            static_cast<std::size_t>(kKeyDim) * sizeof(float);
+        const std::size_t gdn_out_bytes =
+            static_cast<std::size_t>(kValueDim) * sizeof(float);
+        const std::size_t gdn_state_bytes =
+            kGdnStateValues * sizeof(float);
+
+        auto align256 = [](std::size_t n) {
+            return (n + 255u) & ~std::size_t(255u);
+        };
+
+        // Model tensors and persistent test-state inputs.
+        const std::size_t qkv_w_off = 0;
+        const std::size_t z_w_off = align256(qkv_w_off + qkv_bytes);
+        const std::size_t beta_w_off = align256(z_w_off + z_bytes);
+        const std::size_t alpha_w_off =
+            align256(beta_w_off + small_matrix_bytes);
+        const std::size_t norm_w_off =
+            align256(alpha_w_off + small_matrix_bytes);
+        const std::size_t conv_w_off =
+            align256(norm_w_off + hidden_bytes);
+        const std::size_t dt_off =
+            align256(conv_w_off + conv_weight_bytes);
+        const std::size_t a_off =
+            align256(dt_off + small_bytes);
+        const std::size_t ssm_norm_w_off =
+            align256(a_off + small_bytes);
+        const std::size_t ssm_out_w_off =
+            align256(ssm_norm_w_off + ssm_norm_bytes);
+        const std::size_t post_norm_w_off =
+            align256(ssm_out_w_off + ssm_out_bytes);
+        const std::size_t ffn_gate_w_off =
+            align256(post_norm_w_off + post_norm_bytes);
+        const std::size_t ffn_up_w_off =
+            align256(ffn_gate_w_off + ffn_gate_bytes);
+        const std::size_t ffn_down_w_off =
+            align256(ffn_up_w_off + ffn_up_bytes);
+        const std::size_t hidden_off =
+            align256(ffn_down_w_off + ffn_down_bytes);
+        const std::size_t conv_state_in_off =
+            align256(hidden_off + hidden_bytes);
+        const std::size_t gdn_state_in_off =
+            align256(conv_state_in_off + conv_state_bytes);
+
+        // Runtime workspace.
+        const std::size_t sumsq_off =
+            align256(gdn_state_in_off + gdn_state_bytes);
+        const std::size_t normed_off =
+            align256(sumsq_off + sizeof(float));
+        const std::size_t qkv_out_off =
+            align256(normed_off + hidden_bytes);
+        const std::size_t z_out_off =
+            align256(qkv_out_off + qkv_out_bytes);
+        const std::size_t beta_raw_off =
+            align256(z_out_off + z_out_bytes);
+        const std::size_t alpha_raw_off =
+            align256(beta_raw_off + small_bytes);
+        const std::size_t conv_out_off =
+            align256(alpha_raw_off + small_bytes);
+        const std::size_t conv_state_out_off =
+            align256(conv_out_off + qkv_out_bytes);
+        const std::size_t q_out_off =
+            align256(conv_state_out_off + conv_state_bytes);
+        const std::size_t k_out_off =
+            align256(q_out_off + qk_bytes);
+        const std::size_t beta_out_off =
+            align256(k_out_off + qk_bytes);
+        const std::size_t gate_out_off =
+            align256(beta_out_off + small_bytes);
+        const std::size_t gdn_out_off =
+            align256(gate_out_off + small_bytes);
+        const std::size_t gdn_state_out_off =
+            align256(gdn_out_off + gdn_out_bytes);
+        const std::size_t gated_norm_out_off =
+            align256(gdn_state_out_off + gdn_state_bytes);
+        const std::size_t ssm_out_out_off =
+            align256(gated_norm_out_off + gdn_out_bytes);
+        const std::size_t residual_out_off =
+            align256(ssm_out_out_off + hidden_bytes);
+        const std::size_t ffn_normed_off =
+            align256(residual_out_off + hidden_bytes);
+        const std::size_t ffn_gate_out_off =
+            align256(ffn_normed_off + hidden_bytes);
+        const std::size_t ffn_up_out_off =
+            align256(ffn_gate_out_off + ffn_bytes);
+        const std::size_t ffn_mul_out_off =
+            align256(ffn_up_out_off + ffn_bytes);
+        const std::size_t ffn_down_out_off =
+            align256(ffn_mul_out_off + ffn_bytes);
+        const std::size_t layer_out_off =
+            align256(ffn_down_out_off + hidden_bytes);
+        const std::size_t total_bytes =
+            layer_out_off + hidden_bytes;
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD =
+            CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH =
+            CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using MemsetD32 =
+            CUresult(*)(CUdeviceptr, unsigned int, std::size_t);
+        using ModuleLoadDataEx =
+            CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction =
+            CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel =
+            CUresult(*)(CUfunction,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod =
+            sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh =
+            sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto memset_d32 =
+            sym<MemsetD32>(handle_, "cuMemsetD32_v2");
+        const auto module_load_ex =
+            sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload =
+            sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function =
+            sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch =
+            sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync =
+            sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        // Deterministic decode-time input and recurrent states.
+        std::vector<float> hidden(kCols);
+        std::vector<float> conv_state_in(
+            static_cast<std::size_t>(kConvStateSteps) * kQkvRows);
+        std::vector<float> gdn_state_in(kGdnStateValues);
+
+        for (std::uint32_t i = 0; i < kCols; ++i) {
+            const float fi = static_cast<float>(i);
+            hidden[i] =
+                std::sin(fi * 0.017f) * 0.65f +
+                std::cos(fi * 0.011f) * 0.35f;
+        }
+        for (std::uint32_t s = 0; s < kConvStateSteps; ++s) {
+            for (std::uint32_t i = 0; i < kQkvRows; ++i) {
+                const float fi = static_cast<float>(i);
+                const float fs = static_cast<float>(s + 1);
+                conv_state_in[
+                    static_cast<std::size_t>(s) * kQkvRows + i] =
+                    0.08f *
+                        std::sin(fi * (0.0029f + 0.0006f * fs)) +
+                    0.03f *
+                        std::cos(fi * (0.0017f + 0.0004f * fs));
+            }
+        }
+        for (std::size_t i = 0; i < gdn_state_in.size(); ++i) {
+            const float fi = static_cast<float>(i);
+            gdn_state_in[i] =
+                0.011f * std::sin(fi * 0.0011f) +
+                0.005f * std::cos(fi * 0.00073f);
+        }
+
+        const CUdeviceptr base = memory.ptr();
+        const CUdeviceptr qkv_w_ptr = base + qkv_w_off;
+        const CUdeviceptr z_w_ptr = base + z_w_off;
+        const CUdeviceptr beta_w_ptr = base + beta_w_off;
+        const CUdeviceptr alpha_w_ptr = base + alpha_w_off;
+        const CUdeviceptr norm_w_ptr = base + norm_w_off;
+        const CUdeviceptr conv_w_ptr = base + conv_w_off;
+        const CUdeviceptr dt_ptr = base + dt_off;
+        const CUdeviceptr a_ptr = base + a_off;
+        const CUdeviceptr ssm_norm_w_ptr = base + ssm_norm_w_off;
+        const CUdeviceptr ssm_out_w_ptr = base + ssm_out_w_off;
+        const CUdeviceptr post_norm_w_ptr = base + post_norm_w_off;
+        const CUdeviceptr ffn_gate_w_ptr = base + ffn_gate_w_off;
+        const CUdeviceptr ffn_up_w_ptr = base + ffn_up_w_off;
+        const CUdeviceptr ffn_down_w_ptr = base + ffn_down_w_off;
+        const CUdeviceptr hidden_ptr = base + hidden_off;
+        const CUdeviceptr conv_state_in_ptr = base + conv_state_in_off;
+        const CUdeviceptr gdn_state_in_ptr = base + gdn_state_in_off;
+
+        const CUdeviceptr sumsq_ptr = base + sumsq_off;
+        const CUdeviceptr normed_ptr = base + normed_off;
+        const CUdeviceptr qkv_out_ptr = base + qkv_out_off;
+        const CUdeviceptr z_out_ptr = base + z_out_off;
+        const CUdeviceptr beta_raw_ptr = base + beta_raw_off;
+        const CUdeviceptr alpha_raw_ptr = base + alpha_raw_off;
+        const CUdeviceptr conv_out_ptr = base + conv_out_off;
+        const CUdeviceptr conv_state_out_ptr = base + conv_state_out_off;
+        const CUdeviceptr q_out_ptr = base + q_out_off;
+        const CUdeviceptr k_out_ptr = base + k_out_off;
+        const CUdeviceptr beta_out_ptr = base + beta_out_off;
+        const CUdeviceptr gate_out_ptr = base + gate_out_off;
+        const CUdeviceptr gdn_out_ptr = base + gdn_out_off;
+        const CUdeviceptr gdn_state_out_ptr = base + gdn_state_out_off;
+        const CUdeviceptr gated_norm_out_ptr = base + gated_norm_out_off;
+        const CUdeviceptr ssm_out_out_ptr = base + ssm_out_out_off;
+        const CUdeviceptr residual_out_ptr = base + residual_out_off;
+        const CUdeviceptr ffn_normed_ptr = base + ffn_normed_off;
+        const CUdeviceptr ffn_gate_out_ptr = base + ffn_gate_out_off;
+        const CUdeviceptr ffn_up_out_ptr = base + ffn_up_out_off;
+        const CUdeviceptr ffn_mul_out_ptr = base + ffn_mul_out_off;
+        const CUdeviceptr ffn_down_out_ptr = base + ffn_down_out_off;
+        const CUdeviceptr layer_out_ptr = base + layer_out_off;
+
+        check(handle_, memcpy_htod(
+            qkv_w_ptr, qkv_matrix, qkv_bytes),
+            "cuMemcpyHtoD(front qkv weight)");
+        check(handle_, memcpy_htod(
+            z_w_ptr, z_matrix, z_bytes),
+            "cuMemcpyHtoD(front z weight)");
+        check(handle_, memcpy_htod(
+            beta_w_ptr, beta_matrix, small_matrix_bytes),
+            "cuMemcpyHtoD(front beta weight)");
+        check(handle_, memcpy_htod(
+            alpha_w_ptr, alpha_matrix, small_matrix_bytes),
+            "cuMemcpyHtoD(front alpha weight)");
+        check(handle_, memcpy_htod(
+            norm_w_ptr, norm_weight, hidden_bytes),
+            "cuMemcpyHtoD(front norm weight)");
+        check(handle_, memcpy_htod(
+            conv_w_ptr, conv_weight, conv_weight_bytes),
+            "cuMemcpyHtoD(front conv weight)");
+        check(handle_, memcpy_htod(
+            dt_ptr, dt_bias, small_bytes),
+            "cuMemcpyHtoD(front dt bias)");
+        check(handle_, memcpy_htod(
+            a_ptr, ssm_a, small_bytes),
+            "cuMemcpyHtoD(front ssm a)");
+        check(handle_, memcpy_htod(
+            ssm_norm_w_ptr, ssm_norm_weight, ssm_norm_bytes),
+            "cuMemcpyHtoD(attention ssm norm)");
+        check(handle_, memcpy_htod(
+            ssm_out_w_ptr, ssm_out_matrix, ssm_out_bytes),
+            "cuMemcpyHtoD(attention ssm out weight)");
+        check(handle_, memcpy_htod(
+            post_norm_w_ptr, post_norm_weight, post_norm_bytes),
+            "cuMemcpyHtoD(ffn post norm)");
+        check(handle_, memcpy_htod(
+            ffn_gate_w_ptr, ffn_gate_matrix, ffn_gate_bytes),
+            "cuMemcpyHtoD(ffn gate weight)");
+        check(handle_, memcpy_htod(
+            ffn_up_w_ptr, ffn_up_matrix, ffn_up_bytes),
+            "cuMemcpyHtoD(ffn up weight)");
+        check(handle_, memcpy_htod(
+            ffn_down_w_ptr, ffn_down_matrix, ffn_down_bytes),
+            "cuMemcpyHtoD(ffn down weight)");
+        check(handle_, memcpy_htod(
+            hidden_ptr, hidden.data(), hidden_bytes),
+            "cuMemcpyHtoD(front hidden)");
+        check(handle_, memcpy_htod(
+            conv_state_in_ptr, conv_state_in.data(), conv_state_bytes),
+            "cuMemcpyHtoD(front conv state)");
+        check(handle_, memcpy_htod(
+            gdn_state_in_ptr, gdn_state_in.data(), gdn_state_bytes),
+            "cuMemcpyHtoD(front gdn state)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        auto load_module = [&](const char* ptx, const char* label) {
+            std::array<char, 8192> jit_info{};
+            std::array<char, 8192> jit_error{};
+            int jit_options[] = {
+                CU_JIT_INFO_LOG_BUFFER,
+                CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+                CU_JIT_ERROR_LOG_BUFFER,
+                CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                CU_JIT_LOG_VERBOSE,
+            };
+            void* jit_values[] = {
+                jit_info.data(),
+                reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(jit_info.size())),
+                jit_error.data(),
+                reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(jit_error.size())),
+                reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(1)),
+            };
+            CUmodule module{};
+            const auto rc = module_load_ex(
+                &module,
+                ptx,
+                static_cast<unsigned int>(
+                    sizeof(jit_options) / sizeof(jit_options[0])),
+                jit_options,
+                jit_values);
+            if (rc != CUDA_SUCCESS) {
+                std::string detail = cuda_error(handle_, rc, label);
+                if (jit_error[0] != '\0') {
+                    detail +=
+                        std::string("\nPTX JIT error log:\n") +
+                        jit_error.data();
+                }
+                if (jit_info[0] != '\0') {
+                    detail +=
+                        std::string("\nPTX JIT info log:\n") +
+                        jit_info.data();
+                }
+                throw std::runtime_error(detail);
+            }
+            return module;
+        };
+
+        CUmodule norm_module =
+            load_module(kRmsNormPtx, "cuModuleLoadDataEx(front RMSNorm)");
+        CUmodule q5_module{};
+        CUmodule q4_module{};
+        CUmodule prep_module{};
+        CUmodule gdn_module{};
+        CUmodule tail_module{};
+        CUmodule iq4_module{};
+
+        try {
+            q5_module = load_module(
+                kQ5KSm86SoAGemvVecPtx,
+                "cuModuleLoadDataEx(front Q5)");
+            q4_module = load_module(
+                kQ4KGemvPtx,
+                "cuModuleLoadDataEx(front Q4)");
+            prep_module = load_module(
+                kRecurrentPrepPtx,
+                "cuModuleLoadDataEx(front prep)");
+            gdn_module = load_module(
+                kGdnAr128Ptx,
+                "cuModuleLoadDataEx(front GDN)");
+            tail_module = load_module(
+                kRecurrentTailPtx,
+                "cuModuleLoadDataEx(attention tail)");
+            iq4_module = load_module(
+                kIQ4XSGemvPrmtPtx,
+                "cuModuleLoadDataEx(ffn IQ4_XS)");
+
+            CUfunction sum_fn{}, norm_fn{}, q5_fn{}, q4_fn{};
+            CUfunction conv_fn{}, qk_fn{}, bg_fn{}, gdn_fn{};
+            CUfunction gated_norm_fn{}, residual_fn{};
+            CUfunction iq4_fn{}, ffn_mul_fn{};
+
+            check(handle_, module_get_function(
+                &sum_fn, norm_module, "q38_sumsq"),
+                "cuModuleGetFunction(front sumsq)");
+            check(handle_, module_get_function(
+                &norm_fn, norm_module, "q38_rmsnorm_apply"),
+                "cuModuleGetFunction(front rmsnorm)");
+            check(handle_, module_get_function(
+                &q5_fn, q5_module, "q38_q5k_sm86_soa_gemv_vec"),
+                "cuModuleGetFunction(front q5)");
+            check(handle_, module_get_function(
+                &q4_fn, q4_module, "q38_q4k_gemv_f32"),
+                "cuModuleGetFunction(front q4)");
+            check(handle_, module_get_function(
+                &conv_fn, prep_module, "q38_conv4_silu_roll"),
+                "cuModuleGetFunction(front conv)");
+            check(handle_, module_get_function(
+                &qk_fn, prep_module, "q38_qk_l2norm_128"),
+                "cuModuleGetFunction(front qk norm)");
+            check(handle_, module_get_function(
+                &bg_fn, prep_module, "q38_beta_gate_48"),
+                "cuModuleGetFunction(front beta gate)");
+            check(handle_, module_get_function(
+                &gdn_fn, gdn_module, "q38_gdn_ar_128"),
+                "cuModuleGetFunction(front gdn)");
+            check(handle_, module_get_function(
+                &gated_norm_fn, tail_module, "q38_gated_rmsnorm_silu_128"),
+                "cuModuleGetFunction(attention gated norm)");
+            check(handle_, module_get_function(
+                &residual_fn, tail_module, "q38_add_residual_f32"),
+                "cuModuleGetFunction(attention residual)");
+            check(handle_, module_get_function(
+                &ffn_mul_fn, tail_module, "q38_ffn_silu_mul_f32"),
+                "cuModuleGetFunction(ffn silu mul)");
+            check(handle_, module_get_function(
+                &iq4_fn, iq4_module, "q38_iq4xs_gemv_f32_prmt"),
+                "cuModuleGetFunction(ffn IQ4_XS)");
+
+            // RMSNorm args.
+            constexpr unsigned int norm_block = 256;
+            const unsigned int norm_grid =
+                (kCols + norm_block - 1) / norm_block;
+
+            CUdeviceptr sum_x = hidden_ptr;
+            CUdeviceptr sum_out = sumsq_ptr;
+            std::uint32_t norm_count = kCols;
+            void* sum_params[] = {
+                &sum_x, &sum_out, &norm_count
+            };
+
+            CUdeviceptr norm_x = hidden_ptr;
+            CUdeviceptr norm_w = norm_w_ptr;
+            CUdeviceptr norm_y = normed_ptr;
+            CUdeviceptr norm_sumsq = sumsq_ptr;
+            float norm_eps = rms_eps;
+            void* norm_params[] = {
+                &norm_x, &norm_w, &norm_y,
+                &norm_sumsq, &norm_count, &norm_eps
+            };
+
+            // Q5 qkv args.
+            CUdeviceptr qkv_meta = qkv_w_ptr;
+            CUdeviceptr qkv_qh = qkv_w_ptr + qkv_qh_offset;
+            CUdeviceptr qkv_qs = qkv_w_ptr + qkv_qs_offset;
+            CUdeviceptr qkv_x = normed_ptr;
+            CUdeviceptr qkv_y = qkv_out_ptr;
+            std::uint32_t qkv_cols = kCols;
+            std::uint32_t qkv_rows = kQkvRows;
+            void* qkv_params[] = {
+                &qkv_meta, &qkv_qh, &qkv_qs, &qkv_x, &qkv_y,
+                &qkv_cols, &qkv_rows
+            };
+
+            // Q5 z args.
+            CUdeviceptr z_meta = z_w_ptr;
+            CUdeviceptr z_qh = z_w_ptr + z_qh_offset;
+            CUdeviceptr z_qs = z_w_ptr + z_qs_offset;
+            CUdeviceptr z_x = normed_ptr;
+            CUdeviceptr z_y = z_out_ptr;
+            std::uint32_t z_cols = kCols;
+            std::uint32_t z_rows = kZRows;
+            void* z_params[] = {
+                &z_meta, &z_qh, &z_qs, &z_x, &z_y,
+                &z_cols, &z_rows
+            };
+
+            // Q4 beta/alpha args.
+            CUdeviceptr beta_w = beta_w_ptr;
+            CUdeviceptr beta_x = normed_ptr;
+            CUdeviceptr beta_y = beta_raw_ptr;
+            std::uint32_t beta_cols = kCols;
+            std::uint32_t beta_rows = kSmallRows;
+            void* beta_params[] = {
+                &beta_w, &beta_x, &beta_y,
+                &beta_cols, &beta_rows
+            };
+
+            CUdeviceptr alpha_w = alpha_w_ptr;
+            CUdeviceptr alpha_x = normed_ptr;
+            CUdeviceptr alpha_y = alpha_raw_ptr;
+            std::uint32_t alpha_cols = kCols;
+            std::uint32_t alpha_rows = kSmallRows;
+            void* alpha_params[] = {
+                &alpha_w, &alpha_x, &alpha_y,
+                &alpha_cols, &alpha_rows
+            };
+
+            // Conv prep args.
+            CUdeviceptr c_qkv = qkv_out_ptr;
+            CUdeviceptr c_w = conv_w_ptr;
+            CUdeviceptr c_si = conv_state_in_ptr;
+            CUdeviceptr c_co = conv_out_ptr;
+            CUdeviceptr c_so = conv_state_out_ptr;
+            std::uint32_t c_channels = kQkvRows;
+            float log2e = 1.4426950408889634f;
+            void* conv_params[] = {
+                &c_qkv, &c_w, &c_si, &c_co, &c_so,
+                &c_channels, &log2e
+            };
+
+            CUdeviceptr n_conv = conv_out_ptr;
+            CUdeviceptr n_q = q_out_ptr;
+            CUdeviceptr n_k = k_out_ptr;
+            float qk_eps = rms_eps;
+            void* qk_params[] = {
+                &n_conv, &n_q, &n_k, &qk_eps
+            };
+
+            CUdeviceptr b_br = beta_raw_ptr;
+            CUdeviceptr b_ar = alpha_raw_ptr;
+            CUdeviceptr b_dt = dt_ptr;
+            CUdeviceptr b_a = a_ptr;
+            CUdeviceptr b_bo = beta_out_ptr;
+            CUdeviceptr b_go = gate_out_ptr;
+            float inv_log2e = 0.6931471805599453f;
+            void* bg_params[] = {
+                &b_br, &b_ar, &b_dt, &b_a, &b_bo, &b_go,
+                &log2e, &inv_log2e
+            };
+
+            // GDN args. v is the last 6144 values of conv_out.
+            CUdeviceptr g_q = q_out_ptr;
+            CUdeviceptr g_k = k_out_ptr;
+            CUdeviceptr g_v =
+                conv_out_ptr +
+                static_cast<CUdeviceptr>(2 * kKeyDim * sizeof(float));
+            CUdeviceptr g_gate = gate_out_ptr;
+            CUdeviceptr g_beta = beta_out_ptr;
+            CUdeviceptr g_state_in = gdn_state_in_ptr;
+            CUdeviceptr g_out = gdn_out_ptr;
+            CUdeviceptr g_state_out = gdn_state_out_ptr;
+            std::uint32_t g_qk_heads = kQkHeads;
+            std::uint32_t g_value_heads = kValueHeads;
+            float g_scale =
+                1.0f / std::sqrt(static_cast<float>(kHeadDim));
+            void* gdn_params[] = {
+                &g_q, &g_k, &g_v, &g_gate, &g_beta,
+                &g_state_in, &g_out, &g_state_out,
+                &g_qk_heads, &g_value_heads,
+                &g_scale, &log2e
+            };
+
+            CUdeviceptr gn_input = gdn_out_ptr;
+            CUdeviceptr gn_weight = ssm_norm_w_ptr;
+            CUdeviceptr gn_z = z_out_ptr;
+            CUdeviceptr gn_out = gated_norm_out_ptr;
+            float gn_eps = rms_eps;
+            void* gated_norm_params[] = {
+                &gn_input, &gn_weight, &gn_z, &gn_out,
+                &gn_eps, &log2e
+            };
+
+            CUdeviceptr so_meta = ssm_out_w_ptr;
+            CUdeviceptr so_qh = ssm_out_w_ptr + ssm_out_qh_offset;
+            CUdeviceptr so_qs = ssm_out_w_ptr + ssm_out_qs_offset;
+            CUdeviceptr so_x = gated_norm_out_ptr;
+            CUdeviceptr so_y = ssm_out_out_ptr;
+            std::uint32_t so_cols = kValueDim;
+            std::uint32_t so_rows = kCols;
+            void* ssm_out_params[] = {
+                &so_meta, &so_qh, &so_qs, &so_x, &so_y,
+                &so_cols, &so_rows
+            };
+
+            CUdeviceptr r_x = ssm_out_out_ptr;
+            CUdeviceptr r_residual = hidden_ptr;
+            CUdeviceptr r_out = residual_out_ptr;
+            std::uint32_t r_n = kCols;
+            void* residual_params[] = {
+                &r_x, &r_residual, &r_out, &r_n
+            };
+
+            CUdeviceptr fsum_x = residual_out_ptr;
+            CUdeviceptr fsum_out = sumsq_ptr;
+            std::uint32_t ffn_norm_count = kCols;
+            void* ffn_sum_params[] = {
+                &fsum_x, &fsum_out, &ffn_norm_count
+            };
+
+            CUdeviceptr fn_x = residual_out_ptr;
+            CUdeviceptr fn_w = post_norm_w_ptr;
+            CUdeviceptr fn_y = ffn_normed_ptr;
+            CUdeviceptr fn_sumsq = sumsq_ptr;
+            float ffn_norm_eps = rms_eps;
+            void* ffn_norm_params[] = {
+                &fn_x, &fn_w, &fn_y,
+                &fn_sumsq, &ffn_norm_count, &ffn_norm_eps
+            };
+
+            CUdeviceptr fg_w = ffn_gate_w_ptr;
+            CUdeviceptr fg_x = ffn_normed_ptr;
+            CUdeviceptr fg_y = ffn_gate_out_ptr;
+            std::uint32_t fg_cols = kCols;
+            std::uint32_t fg_rows = kFfnDim;
+            void* ffn_gate_params[] = {
+                &fg_w, &fg_x, &fg_y, &fg_cols, &fg_rows
+            };
+
+            CUdeviceptr fu_meta = ffn_up_w_ptr;
+            CUdeviceptr fu_qh = ffn_up_w_ptr + ffn_up_qh_offset;
+            CUdeviceptr fu_qs = ffn_up_w_ptr + ffn_up_qs_offset;
+            CUdeviceptr fu_x = ffn_normed_ptr;
+            CUdeviceptr fu_y = ffn_up_out_ptr;
+            std::uint32_t fu_cols = kCols;
+            std::uint32_t fu_rows = kFfnDim;
+            void* ffn_up_params[] = {
+                &fu_meta, &fu_qh, &fu_qs, &fu_x, &fu_y,
+                &fu_cols, &fu_rows
+            };
+
+            CUdeviceptr fm_gate = ffn_gate_out_ptr;
+            CUdeviceptr fm_up = ffn_up_out_ptr;
+            CUdeviceptr fm_out = ffn_mul_out_ptr;
+            std::uint32_t fm_n = kFfnDim;
+            void* ffn_mul_params[] = {
+                &fm_gate, &fm_up, &fm_out, &fm_n, &log2e
+            };
+
+            CUdeviceptr fd_meta = ffn_down_w_ptr;
+            CUdeviceptr fd_qh = ffn_down_w_ptr + ffn_down_qh_offset;
+            CUdeviceptr fd_qs = ffn_down_w_ptr + ffn_down_qs_offset;
+            CUdeviceptr fd_x = ffn_mul_out_ptr;
+            CUdeviceptr fd_y = ffn_down_out_ptr;
+            std::uint32_t fd_cols = kFfnDim;
+            std::uint32_t fd_rows = kCols;
+            void* ffn_down_params[] = {
+                &fd_meta, &fd_qh, &fd_qs, &fd_x, &fd_y,
+                &fd_cols, &fd_rows
+            };
+
+            CUdeviceptr lr_x = ffn_down_out_ptr;
+            CUdeviceptr lr_residual = residual_out_ptr;
+            CUdeviceptr lr_out = layer_out_ptr;
+            std::uint32_t lr_n = kCols;
+            void* layer_residual_params[] = {
+                &lr_x, &lr_residual, &lr_out, &lr_n
+            };
+
+            const unsigned int qkv_grid =
+                (kQkvRows + 3u) / 4u;
+            const unsigned int z_grid =
+                (kZRows + 3u) / 4u;
+            const unsigned int conv_grid =
+                (kQkvRows + 255u) / 256u;
+            const unsigned int gdn_grid_y =
+                (kHeadDim + 3u) / 4u;
+            const unsigned int ssm_out_grid =
+                (kCols + 3u) / 4u;
+            const unsigned int residual_grid =
+                (kCols + 255u) / 256u;
+            const unsigned int ffn_gate_grid =
+                (kFfnDim + 3u) / 4u;
+            const unsigned int ffn_up_grid =
+                (kFfnDim + 3u) / 4u;
+            const unsigned int ffn_pointwise_grid =
+                (kFfnDim + 255u) / 256u;
+            const unsigned int ffn_down_grid =
+                (kCols + 3u) / 4u;
+
+            auto launch_projection = [&]() {
+                check(handle_, memset_d32(
+                    sumsq_ptr, 0, 1),
+                    "cuMemsetD32(front sumsq)");
+                check(handle_, launch(
+                    sum_fn, norm_grid, 1, 1,
+                    norm_block, 1, 1,
+                    0, nullptr, sum_params, nullptr),
+                    "cuLaunchKernel(front sumsq)");
+                check(handle_, launch(
+                    norm_fn, norm_grid, 1, 1,
+                    norm_block, 1, 1,
+                    0, nullptr, norm_params, nullptr),
+                    "cuLaunchKernel(front rmsnorm)");
+                check(handle_, launch(
+                    q5_fn, qkv_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, qkv_params, nullptr),
+                    "cuLaunchKernel(front qkv)");
+                check(handle_, launch(
+                    q5_fn, z_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, z_params, nullptr),
+                    "cuLaunchKernel(front z)");
+                check(handle_, launch(
+                    q4_fn, kSmallRows, 1, 1,
+                    32, 1, 1,
+                    0, nullptr, beta_params, nullptr),
+                    "cuLaunchKernel(front beta)");
+                check(handle_, launch(
+                    q4_fn, kSmallRows, 1, 1,
+                    32, 1, 1,
+                    0, nullptr, alpha_params, nullptr),
+                    "cuLaunchKernel(front alpha)");
+            };
+
+            auto launch_prep = [&]() {
+                check(handle_, launch(
+                    conv_fn, conv_grid, 1, 1,
+                    256, 1, 1,
+                    0, nullptr, conv_params, nullptr),
+                    "cuLaunchKernel(front conv)");
+                check(handle_, launch(
+                    qk_fn, 32, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, qk_params, nullptr),
+                    "cuLaunchKernel(front qk norm)");
+                check(handle_, launch(
+                    bg_fn, 1, 1, 1,
+                    64, 1, 1,
+                    0, nullptr, bg_params, nullptr),
+                    "cuLaunchKernel(front beta gate)");
+            };
+
+            auto launch_gdn = [&]() {
+                check(handle_, launch(
+                    gdn_fn,
+                    kValueHeads, gdn_grid_y, 1,
+                    128, 1, 1,
+                    0, nullptr, gdn_params, nullptr),
+                    "cuLaunchKernel(front gdn)");
+            };
+
+            auto launch_gated_norm = [&]() {
+                check(handle_, launch(
+                    gated_norm_fn,
+                    kValueHeads, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, gated_norm_params, nullptr),
+                    "cuLaunchKernel(attention gated norm)");
+            };
+
+            auto launch_ssm_out = [&]() {
+                check(handle_, launch(
+                    q5_fn,
+                    ssm_out_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, ssm_out_params, nullptr),
+                    "cuLaunchKernel(attention ssm_out)");
+            };
+
+            auto launch_residual = [&]() {
+                check(handle_, launch(
+                    residual_fn,
+                    residual_grid, 1, 1,
+                    256, 1, 1,
+                    0, nullptr, residual_params, nullptr),
+                    "cuLaunchKernel(attention residual)");
+            };
+
+            auto launch_front = [&]() {
+                launch_projection();
+                launch_prep();
+                launch_gdn();
+            };
+
+            auto launch_tail = [&]() {
+                launch_gated_norm();
+                launch_ssm_out();
+                launch_residual();
+            };
+
+            auto launch_attention = [&]() {
+                launch_front();
+                launch_tail();
+            };
+
+            auto launch_post_norm = [&]() {
+                check(handle_, memset_d32(
+                    sumsq_ptr, 0, 1),
+                    "cuMemsetD32(ffn sumsq)");
+                check(handle_, launch(
+                    sum_fn, norm_grid, 1, 1,
+                    norm_block, 1, 1,
+                    0, nullptr, ffn_sum_params, nullptr),
+                    "cuLaunchKernel(ffn sumsq)");
+                check(handle_, launch(
+                    norm_fn, norm_grid, 1, 1,
+                    norm_block, 1, 1,
+                    0, nullptr, ffn_norm_params, nullptr),
+                    "cuLaunchKernel(ffn post norm)");
+            };
+
+            auto launch_ffn_gate = [&]() {
+                check(handle_, launch(
+                    iq4_fn,
+                    ffn_gate_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, ffn_gate_params, nullptr),
+                    "cuLaunchKernel(ffn gate IQ4_XS)");
+            };
+
+            auto launch_ffn_up = [&]() {
+                check(handle_, launch(
+                    q5_fn,
+                    ffn_up_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, ffn_up_params, nullptr),
+                    "cuLaunchKernel(ffn up Q5)");
+            };
+
+            auto launch_ffn_pointwise = [&]() {
+                check(handle_, launch(
+                    ffn_mul_fn,
+                    ffn_pointwise_grid, 1, 1,
+                    256, 1, 1,
+                    0, nullptr, ffn_mul_params, nullptr),
+                    "cuLaunchKernel(ffn silu mul)");
+            };
+
+            auto launch_ffn_down = [&]() {
+                check(handle_, launch(
+                    q5_fn,
+                    ffn_down_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, ffn_down_params, nullptr),
+                    "cuLaunchKernel(ffn down Q5)");
+            };
+
+            auto launch_layer_residual = [&]() {
+                check(handle_, launch(
+                    residual_fn,
+                    residual_grid, 1, 1,
+                    256, 1, 1,
+                    0, nullptr, layer_residual_params, nullptr),
+                    "cuLaunchKernel(layer residual)");
+            };
+
+            auto launch_ffn = [&]() {
+                launch_post_norm();
+                launch_ffn_gate();
+                launch_ffn_up();
+                launch_ffn_pointwise();
+                launch_ffn_down();
+                launch_layer_residual();
+            };
+
+            auto launch_chain = [&]() {
+                launch_attention();
+                launch_ffn();
+            };
+
+            // One full layer for correctness.
+            launch_chain();
+            check(handle_, sync(),
+                  "cuCtxSynchronize(layer0 recurrent front correctness)");
+
+            // Read GPU projection products used as the CPU downstream oracle.
+            // The projection kernels are already independently validated by
+            // q38-layer0-projections; this check focuses on composition.
+            std::vector<float> qkv_gpu(kQkvRows);
+            std::vector<float> beta_raw_gpu(kSmallRows);
+            std::vector<float> alpha_raw_gpu(kSmallRows);
+            std::vector<float> conv_gpu(kQkvRows);
+            std::vector<float> conv_state_gpu(
+                static_cast<std::size_t>(kConvStateSteps) * kQkvRows);
+            std::vector<float> q_gpu(kKeyDim);
+            std::vector<float> k_gpu(kKeyDim);
+            std::vector<float> beta_gpu(kSmallRows);
+            std::vector<float> gate_gpu(kSmallRows);
+            std::vector<float> gdn_out_gpu(kValueDim);
+            std::vector<float> gdn_state_gpu(kGdnStateValues);
+            std::vector<float> z_gpu(kZRows);
+            std::vector<float> gated_norm_gpu(kValueDim);
+            std::vector<float> ssm_out_gpu(kCols);
+            std::vector<float> residual_gpu(kCols);
+            std::vector<float> ffn_normed_gpu(kCols);
+            std::vector<float> ffn_gate_gpu(kFfnDim);
+            std::vector<float> ffn_up_gpu(kFfnDim);
+            std::vector<float> ffn_mul_gpu(kFfnDim);
+            std::vector<float> ffn_down_gpu(kCols);
+            std::vector<float> layer_out_gpu(kCols);
+
+            check(handle_, memcpy_dtoh(
+                qkv_gpu.data(), qkv_out_ptr, qkv_out_bytes),
+                "cuMemcpyDtoH(front qkv)");
+            check(handle_, memcpy_dtoh(
+                beta_raw_gpu.data(), beta_raw_ptr, small_bytes),
+                "cuMemcpyDtoH(front beta raw)");
+            check(handle_, memcpy_dtoh(
+                alpha_raw_gpu.data(), alpha_raw_ptr, small_bytes),
+                "cuMemcpyDtoH(front alpha raw)");
+            check(handle_, memcpy_dtoh(
+                conv_gpu.data(), conv_out_ptr, qkv_out_bytes),
+                "cuMemcpyDtoH(front conv)");
+            check(handle_, memcpy_dtoh(
+                conv_state_gpu.data(), conv_state_out_ptr, conv_state_bytes),
+                "cuMemcpyDtoH(front conv state)");
+            check(handle_, memcpy_dtoh(
+                q_gpu.data(), q_out_ptr, qk_bytes),
+                "cuMemcpyDtoH(front q)");
+            check(handle_, memcpy_dtoh(
+                k_gpu.data(), k_out_ptr, qk_bytes),
+                "cuMemcpyDtoH(front k)");
+            check(handle_, memcpy_dtoh(
+                beta_gpu.data(), beta_out_ptr, small_bytes),
+                "cuMemcpyDtoH(front beta)");
+            check(handle_, memcpy_dtoh(
+                gate_gpu.data(), gate_out_ptr, small_bytes),
+                "cuMemcpyDtoH(front gate)");
+            check(handle_, memcpy_dtoh(
+                gdn_out_gpu.data(), gdn_out_ptr, gdn_out_bytes),
+                "cuMemcpyDtoH(front gdn output)");
+            check(handle_, memcpy_dtoh(
+                gdn_state_gpu.data(), gdn_state_out_ptr, gdn_state_bytes),
+                "cuMemcpyDtoH(front gdn state)");
+            check(handle_, memcpy_dtoh(
+                z_gpu.data(), z_out_ptr, z_out_bytes),
+                "cuMemcpyDtoH(attention z)");
+            check(handle_, memcpy_dtoh(
+                gated_norm_gpu.data(), gated_norm_out_ptr, gdn_out_bytes),
+                "cuMemcpyDtoH(attention gated norm)");
+            check(handle_, memcpy_dtoh(
+                ssm_out_gpu.data(), ssm_out_out_ptr, hidden_bytes),
+                "cuMemcpyDtoH(attention ssm out)");
+            check(handle_, memcpy_dtoh(
+                residual_gpu.data(), residual_out_ptr, hidden_bytes),
+                "cuMemcpyDtoH(attention residual)");
+            check(handle_, memcpy_dtoh(
+                ffn_normed_gpu.data(), ffn_normed_ptr, hidden_bytes),
+                "cuMemcpyDtoH(ffn normed)");
+            check(handle_, memcpy_dtoh(
+                ffn_gate_gpu.data(), ffn_gate_out_ptr, ffn_bytes),
+                "cuMemcpyDtoH(ffn gate)");
+            check(handle_, memcpy_dtoh(
+                ffn_up_gpu.data(), ffn_up_out_ptr, ffn_bytes),
+                "cuMemcpyDtoH(ffn up)");
+            check(handle_, memcpy_dtoh(
+                ffn_mul_gpu.data(), ffn_mul_out_ptr, ffn_bytes),
+                "cuMemcpyDtoH(ffn mul)");
+            check(handle_, memcpy_dtoh(
+                ffn_down_gpu.data(), ffn_down_out_ptr, hidden_bytes),
+                "cuMemcpyDtoH(ffn down)");
+            check(handle_, memcpy_dtoh(
+                layer_out_gpu.data(), layer_out_ptr, hidden_bytes),
+                "cuMemcpyDtoH(layer output)");
+
+            std::vector<float> conv_ref(kQkvRows);
+            std::vector<float> conv_state_ref(
+                static_cast<std::size_t>(kConvStateSteps) * kQkvRows);
+            std::vector<float> q_ref(kKeyDim);
+            std::vector<float> k_ref(kKeyDim);
+            std::vector<float> beta_ref(kSmallRows);
+            std::vector<float> gate_ref(kSmallRows);
+            std::vector<float> gdn_out_ref(kValueDim);
+            std::vector<float> gdn_state_ref(kGdnStateValues);
+
+            for (std::uint32_t ch = 0; ch < kQkvRows; ++ch) {
+                const float x0 = conv_state_in[ch];
+                const float x1 = conv_state_in[kQkvRows + ch];
+                const float x2 = conv_state_in[2 * kQkvRows + ch];
+                const float x3 = qkv_gpu[ch];
+                const float* w =
+                    conv_weight + static_cast<std::size_t>(ch) * 4;
+                const double raw =
+                    static_cast<double>(x0) * w[0] +
+                    static_cast<double>(x1) * w[1] +
+                    static_cast<double>(x2) * w[2] +
+                    static_cast<double>(x3) * w[3];
+                conv_ref[ch] =
+                    static_cast<float>(
+                        raw / (1.0 + std::exp(-raw)));
+                conv_state_ref[ch] = x1;
+                conv_state_ref[kQkvRows + ch] = x2;
+                conv_state_ref[2 * kQkvRows + ch] = x3;
+            }
+
+            for (std::uint32_t h = 0; h < kQkHeads; ++h) {
+                const std::size_t q_base =
+                    static_cast<std::size_t>(h) * kHeadDim;
+                const std::size_t k_base =
+                    static_cast<std::size_t>(kKeyDim) +
+                    static_cast<std::size_t>(h) * kHeadDim;
+
+                double q_ss = 0.0;
+                double k_ss = 0.0;
+                for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                    const double qv = conv_ref[q_base + i];
+                    const double kv = conv_ref[k_base + i];
+                    q_ss += qv * qv;
+                    k_ss += kv * kv;
+                }
+                const double q_inv =
+                    1.0 / std::sqrt(q_ss + static_cast<double>(rms_eps));
+                const double k_inv =
+                    1.0 / std::sqrt(k_ss + static_cast<double>(rms_eps));
+
+                for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                    q_ref[q_base + i] =
+                        static_cast<float>(
+                            static_cast<double>(conv_ref[q_base + i]) *
+                            q_inv);
+                    k_ref[q_base + i] =
+                        static_cast<float>(
+                            static_cast<double>(conv_ref[k_base + i]) *
+                            k_inv);
+                }
+            }
+
+            auto softplus = [](double x) {
+                if (x > 20.0) return x;
+                if (x < -20.0) return std::exp(x);
+                return std::log1p(std::exp(x));
+            };
+            for (std::uint32_t h = 0; h < kSmallRows; ++h) {
+                const double br = beta_raw_gpu[h];
+                beta_ref[h] =
+                    static_cast<float>(
+                        1.0 / (1.0 + std::exp(-br)));
+                const double biased =
+                    static_cast<double>(alpha_raw_gpu[h]) +
+                    static_cast<double>(dt_bias[h]);
+                gate_ref[h] =
+                    static_cast<float>(
+                        softplus(biased) *
+                        static_cast<double>(ssm_a[h]));
+            }
+
+            const double gdn_scale =
+                1.0 / std::sqrt(static_cast<double>(kHeadDim));
+            for (std::uint32_t h = 0; h < kValueHeads; ++h) {
+                const std::uint32_t qh = h % kQkHeads;
+                const float* qh_ptr =
+                    q_ref.data() +
+                    static_cast<std::size_t>(qh) * kHeadDim;
+                const float* kh_ptr =
+                    k_ref.data() +
+                    static_cast<std::size_t>(qh) * kHeadDim;
+                const double g_val =
+                    std::exp(static_cast<double>(gate_ref[h]));
+                const double beta_val =
+                    static_cast<double>(beta_ref[h]);
+
+                for (std::uint32_t col = 0; col < kHeadDim; ++col) {
+                    const std::size_t state_base =
+                        (static_cast<std::size_t>(h) * kHeadDim + col) *
+                        kHeadDim;
+
+                    double kv = 0.0;
+                    for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                        kv +=
+                            static_cast<double>(
+                                gdn_state_in[state_base + i]) *
+                            static_cast<double>(kh_ptr[i]);
+                    }
+
+                    const std::size_t v_idx =
+                        static_cast<std::size_t>(2 * kKeyDim) +
+                        static_cast<std::size_t>(h) * kHeadDim + col;
+                    const double delta =
+                        (static_cast<double>(conv_ref[v_idx]) -
+                         g_val * kv) *
+                        beta_val;
+
+                    double attn = 0.0;
+                    for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                        const double updated =
+                            g_val *
+                                static_cast<double>(
+                                    gdn_state_in[state_base + i]) +
+                            static_cast<double>(kh_ptr[i]) * delta;
+                        gdn_state_ref[state_base + i] =
+                            static_cast<float>(updated);
+                        attn +=
+                            updated * static_cast<double>(qh_ptr[i]);
+                    }
+
+                    gdn_out_ref[
+                        static_cast<std::size_t>(h) * kHeadDim + col] =
+                        static_cast<float>(attn * gdn_scale);
+                }
+            }
+
+            std::vector<float> gated_norm_ref(kValueDim);
+            for (std::uint32_t h = 0; h < kValueHeads; ++h) {
+                const std::size_t base_h =
+                    static_cast<std::size_t>(h) * kHeadDim;
+                double ss = 0.0;
+                for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                    const double x =
+                        static_cast<double>(gdn_out_ref[base_h + i]);
+                    ss += x * x;
+                }
+                const double inv_rms =
+                    1.0 / std::sqrt(
+                        ss / static_cast<double>(kHeadDim) +
+                        static_cast<double>(rms_eps));
+                for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+                    const std::size_t idx = base_h + i;
+                    const double zv = static_cast<double>(z_gpu[idx]);
+                    const double silu_z =
+                        zv / (1.0 + std::exp(-zv));
+                    gated_norm_ref[idx] =
+                        static_cast<float>(
+                            static_cast<double>(gdn_out_ref[idx]) *
+                            inv_rms *
+                            static_cast<double>(ssm_norm_weight[i]) *
+                            silu_z);
+                }
+            }
+
+            constexpr std::size_t kTailCheckedRows = 8;
+            std::array<float, kQ4KValuesPerBlock> tail_deq{};
+            std::array<std::byte, kQ5KSm86BytesPerBlock> tail_block{};
+            std::array<double, kTailCheckedRows> ssm_out_ref{};
+            std::array<double, kTailCheckedRows> residual_ref{};
+
+            for (std::size_t row = 0; row < kTailCheckedRows; ++row) {
+                double dot = 0.0;
+                for (std::size_t ib = 0;
+                     ib < ssm_out_blocks_per_row; ++ib) {
+                    const std::size_t block_index =
+                        row * ssm_out_blocks_per_row + ib;
+                    std::memcpy(
+                        tail_block.data() + 0,
+                        ssm_out_matrix + block_index * 20,
+                        20);
+                    std::memcpy(
+                        tail_block.data() + 20,
+                        ssm_out_matrix +
+                            ssm_out_qh_offset + block_index * 32,
+                        32);
+                    std::memcpy(
+                        tail_block.data() + 52,
+                        ssm_out_matrix +
+                            ssm_out_qs_offset + block_index * 128,
+                        128);
+                    dequantize_q5_k_sm86_block_cpu(
+                        tail_block.data(), tail_deq);
+
+                    const std::size_t base_x =
+                        ib * kQ4KValuesPerBlock;
+                    for (std::size_t j = 0;
+                         j < kQ4KValuesPerBlock; ++j) {
+                        dot +=
+                            static_cast<double>(tail_deq[j]) *
+                            static_cast<double>(
+                                gated_norm_ref[base_x + j]);
+                    }
+                }
+                ssm_out_ref[row] = dot;
+                residual_ref[row] =
+                    dot + static_cast<double>(hidden[row]);
+            }
+
+            Layer0RecurrentFrontStats front_local{};
+
+            auto calc_max_abs = [](const std::vector<float>& a,
+                                   const std::vector<float>& b) {
+                double m = 0.0;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    m = std::max(
+                        m,
+                        std::abs(
+                            static_cast<double>(a[i]) -
+                            static_cast<double>(b[i])));
+                }
+                return m;
+            };
+
+            auto calc_max_rel = [](const std::vector<float>& a,
+                                   const std::vector<float>& b) {
+                double m = 0.0;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    const double ref = static_cast<double>(b[i]);
+                    const double abs_err =
+                        std::abs(
+                            static_cast<double>(a[i]) - ref);
+                    m = std::max(
+                        m,
+                        abs_err /
+                            std::max(1.0e-6, std::abs(ref)));
+                }
+                return m;
+            };
+
+            front_local.conv_max_abs =
+                calc_max_abs(conv_gpu, conv_ref);
+            front_local.q_max_abs =
+                calc_max_abs(q_gpu, q_ref);
+            front_local.k_max_abs =
+                calc_max_abs(k_gpu, k_ref);
+            front_local.beta_max_abs =
+                calc_max_abs(beta_gpu, beta_ref);
+            front_local.gate_max_abs =
+                calc_max_abs(gate_gpu, gate_ref);
+            front_local.conv_state_max_abs =
+                calc_max_abs(conv_state_gpu, conv_state_ref);
+            front_local.gdn_output_max_abs =
+                calc_max_abs(gdn_out_gpu, gdn_out_ref);
+            front_local.gdn_output_max_rel =
+                calc_max_rel(gdn_out_gpu, gdn_out_ref);
+            front_local.gdn_state_max_abs =
+                calc_max_abs(gdn_state_gpu, gdn_state_ref);
+            front_local.gdn_state_max_rel =
+                calc_max_rel(gdn_state_gpu, gdn_state_ref);
+
+            if (front_local.conv_max_abs > 1.0e-3 ||
+                front_local.q_max_abs > 1.0e-3 ||
+                front_local.k_max_abs > 1.0e-3 ||
+                front_local.beta_max_abs > 1.0e-4 ||
+                front_local.gate_max_abs > 1.0e-3 ||
+                front_local.conv_state_max_abs > 1.0e-6 ||
+                (front_local.gdn_output_max_abs > 2.0e-3 &&
+                 front_local.gdn_output_max_rel > 2.0e-3) ||
+                (front_local.gdn_state_max_abs > 1.0e-3 &&
+                 front_local.gdn_state_max_rel > 1.0e-3)) {
+                std::ostringstream oss;
+                oss << "layer0 recurrent front mismatch:"
+                    << " conv=" << front_local.conv_max_abs
+                    << " q=" << front_local.q_max_abs
+                    << " k=" << front_local.k_max_abs
+                    << " beta=" << front_local.beta_max_abs
+                    << " gate=" << front_local.gate_max_abs
+                    << " conv_state=" << front_local.conv_state_max_abs
+                    << " gdn_out_abs=" << front_local.gdn_output_max_abs
+                    << " gdn_out_rel=" << front_local.gdn_output_max_rel
+                    << " gdn_state_abs=" << front_local.gdn_state_max_abs
+                    << " gdn_state_rel=" << front_local.gdn_state_max_rel;
+                throw std::runtime_error(oss.str());
+            }
+
+            std::vector<float> ffn_normed_ref(kCols);
+            double ffn_ss = 0.0;
+            for (float x : residual_gpu) {
+                ffn_ss += static_cast<double>(x) *
+                          static_cast<double>(x);
+            }
+            const double ffn_inv_rms =
+                1.0 / std::sqrt(
+                    ffn_ss / static_cast<double>(kCols) +
+                    static_cast<double>(rms_eps));
+            for (std::uint32_t i = 0; i < kCols; ++i) {
+                ffn_normed_ref[i] =
+                    static_cast<float>(
+                        static_cast<double>(residual_gpu[i]) *
+                        ffn_inv_rms *
+                        static_cast<double>(post_norm_weight[i]));
+            }
+
+            std::vector<float> ffn_mul_ref(kFfnDim);
+            for (std::uint32_t i = 0; i < kFfnDim; ++i) {
+                const double g =
+                    static_cast<double>(ffn_gate_gpu[i]);
+                const double silu_g =
+                    g / (1.0 + std::exp(-g));
+                ffn_mul_ref[i] =
+                    static_cast<float>(
+                        silu_g *
+                        static_cast<double>(ffn_up_gpu[i]));
+            }
+
+            constexpr std::size_t kFfnCheckedRows = 8;
+            std::array<float, kQ4KValuesPerBlock> ffn_down_deq{};
+            std::array<std::byte, kQ5KSm86BytesPerBlock> ffn_down_block{};
+            std::array<double, kFfnCheckedRows> ffn_down_ref{};
+            std::array<double, kFfnCheckedRows> layer_ref{};
+
+            for (std::size_t row = 0; row < kFfnCheckedRows; ++row) {
+                double dot = 0.0;
+                for (std::size_t ib = 0;
+                     ib < ffn_down_blocks_per_row; ++ib) {
+                    const std::size_t block_index =
+                        row * ffn_down_blocks_per_row + ib;
+                    std::memcpy(
+                        ffn_down_block.data() + 0,
+                        ffn_down_matrix + block_index * 20,
+                        20);
+                    std::memcpy(
+                        ffn_down_block.data() + 20,
+                        ffn_down_matrix +
+                            ffn_down_qh_offset + block_index * 32,
+                        32);
+                    std::memcpy(
+                        ffn_down_block.data() + 52,
+                        ffn_down_matrix +
+                            ffn_down_qs_offset + block_index * 128,
+                        128);
+                    dequantize_q5_k_sm86_block_cpu(
+                        ffn_down_block.data(), ffn_down_deq);
+                    const std::size_t base_x =
+                        ib * kQ4KValuesPerBlock;
+                    for (std::size_t j = 0;
+                         j < kQ4KValuesPerBlock; ++j) {
+                        dot +=
+                            static_cast<double>(ffn_down_deq[j]) *
+                            static_cast<double>(
+                                ffn_mul_ref[base_x + j]);
+                    }
+                }
+                ffn_down_ref[row] = dot;
+                layer_ref[row] =
+                    dot + static_cast<double>(residual_gpu[row]);
+            }
+
+            Layer0RecurrentAttentionStats attention_local{};
+
+            for (std::size_t i = 0; i < gated_norm_gpu.size(); ++i) {
+                attention_local.gated_norm_max_abs =
+                    std::max(
+                        attention_local.gated_norm_max_abs,
+                        std::abs(
+                            static_cast<double>(gated_norm_gpu[i]) -
+                            static_cast<double>(gated_norm_ref[i])));
+            }
+
+            for (std::size_t row = 0;
+                 row < kTailCheckedRows; ++row) {
+                attention_local.ssm_out_max_abs =
+                    std::max(
+                        attention_local.ssm_out_max_abs,
+                        std::abs(
+                            static_cast<double>(ssm_out_gpu[row]) -
+                            ssm_out_ref[row]));
+                attention_local.residual_max_abs =
+                    std::max(
+                        attention_local.residual_max_abs,
+                        std::abs(
+                            static_cast<double>(residual_gpu[row]) -
+                            residual_ref[row]));
+            }
+
+            if (attention_local.gated_norm_max_abs > 2.0e-4 ||
+                attention_local.ssm_out_max_abs > 3.0e-3 ||
+                attention_local.residual_max_abs > 3.0e-3) {
+                std::ostringstream oss;
+                oss << "layer0 recurrent attention tail mismatch:"
+                    << " gated_norm="
+                    << attention_local.gated_norm_max_abs
+                    << " ssm_out="
+                    << attention_local.ssm_out_max_abs
+                    << " residual="
+                    << attention_local.residual_max_abs;
+                throw std::runtime_error(oss.str());
+            }
+
+            Layer0FullStats full_local{};
+
+            for (std::size_t i = 0; i < ffn_normed_gpu.size(); ++i) {
+                full_local.ffn_norm_max_abs =
+                    std::max(
+                        full_local.ffn_norm_max_abs,
+                        std::abs(
+                            static_cast<double>(ffn_normed_gpu[i]) -
+                            static_cast<double>(ffn_normed_ref[i])));
+            }
+
+            for (std::size_t i = 0; i < ffn_mul_gpu.size(); ++i) {
+                full_local.ffn_gate_up_max_abs =
+                    std::max(
+                        full_local.ffn_gate_up_max_abs,
+                        std::abs(
+                            static_cast<double>(ffn_mul_gpu[i]) -
+                            static_cast<double>(ffn_mul_ref[i])));
+            }
+
+            for (std::size_t row = 0;
+                 row < kFfnCheckedRows; ++row) {
+                full_local.ffn_down_max_abs =
+                    std::max(
+                        full_local.ffn_down_max_abs,
+                        std::abs(
+                            static_cast<double>(ffn_down_gpu[row]) -
+                            ffn_down_ref[row]));
+                full_local.layer_output_max_abs =
+                    std::max(
+                        full_local.layer_output_max_abs,
+                        std::abs(
+                            static_cast<double>(layer_out_gpu[row]) -
+                            layer_ref[row]));
+            }
+
+            if (full_local.ffn_norm_max_abs > 3.0e-4 ||
+                full_local.ffn_gate_up_max_abs > 3.0e-4 ||
+                full_local.ffn_down_max_abs > 4.0e-3 ||
+                full_local.layer_output_max_abs > 4.0e-3) {
+                std::ostringstream oss;
+                oss << "layer0 FFN mismatch:"
+                    << " norm=" << full_local.ffn_norm_max_abs
+                    << " gate_up=" << full_local.ffn_gate_up_max_abs
+                    << " down=" << full_local.ffn_down_max_abs
+                    << " output=" << full_local.layer_output_max_abs;
+                throw std::runtime_error(oss.str());
+            }
+
+            auto bench = [&](int iters, auto&& fn, const char* label) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < iters; ++i) fn();
+                check(handle_, sync(), label);
+                const auto t1 = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::milli>(
+                    t1 - t0).count() /
+                    static_cast<double>(iters);
+            };
+
+            // Keep attention timing comparable to the standalone target.
+            front_local.projection_ms =
+                bench(50, launch_projection,
+                      "cuCtxSynchronize(front projection benchmark)");
+            front_local.conv_prep_ms =
+                bench(200, launch_prep,
+                      "cuCtxSynchronize(front prep benchmark)");
+            front_local.gdn_ms =
+                bench(200, launch_gdn,
+                      "cuCtxSynchronize(front gdn benchmark)");
+            front_local.sum_stage_ms =
+                front_local.projection_ms +
+                front_local.conv_prep_ms +
+                front_local.gdn_ms;
+            front_local.chain_ms =
+                bench(50, launch_front,
+                      "cuCtxSynchronize(front chain benchmark)");
+
+            attention_local.front_ms = front_local.chain_ms;
+            attention_local.gated_norm_ms =
+                bench(200, launch_gated_norm,
+                      "cuCtxSynchronize(attention gated norm benchmark)");
+            attention_local.ssm_out_ms =
+                bench(50, launch_ssm_out,
+                      "cuCtxSynchronize(attention ssm_out benchmark)");
+            attention_local.tail_ms =
+                bench(50, launch_tail,
+                      "cuCtxSynchronize(attention tail benchmark)");
+            attention_local.sum_stage_ms =
+                attention_local.front_ms +
+                attention_local.tail_ms;
+            attention_local.chain_ms =
+                bench(50, launch_attention,
+                      "cuCtxSynchronize(attention full chain benchmark)");
+
+            full_local.attention_ms = attention_local.chain_ms;
+            full_local.post_norm_ms =
+                bench(100, launch_post_norm,
+                      "cuCtxSynchronize(ffn post norm benchmark)");
+            full_local.ffn_gate_ms =
+                bench(50, launch_ffn_gate,
+                      "cuCtxSynchronize(ffn gate benchmark)");
+            full_local.ffn_up_ms =
+                bench(50, launch_ffn_up,
+                      "cuCtxSynchronize(ffn up benchmark)");
+            full_local.ffn_pointwise_ms =
+                bench(200, launch_ffn_pointwise,
+                      "cuCtxSynchronize(ffn pointwise benchmark)");
+            full_local.ffn_down_ms =
+                bench(50, launch_ffn_down,
+                      "cuCtxSynchronize(ffn down benchmark)");
+            full_local.ffn_ms =
+                bench(50, launch_ffn,
+                      "cuCtxSynchronize(ffn full benchmark)");
+            full_local.sum_stage_ms =
+                full_local.attention_ms +
+                full_local.ffn_ms;
+            full_local.chain_ms =
+                bench(50, launch_chain,
+                      "cuCtxSynchronize(full layer benchmark)");
+
+            if (stats) *stats = full_local;
+        } catch (...) {
+            if (iq4_module) module_unload(iq4_module);
+            if (tail_module) module_unload(tail_module);
+            if (gdn_module) module_unload(gdn_module);
+            if (prep_module) module_unload(prep_module);
+            if (q4_module) module_unload(q4_module);
+            if (q5_module) module_unload(q5_module);
+            module_unload(norm_module);
+            throw;
+        }
+
+        check(handle_, module_unload(iq4_module),
+              "cuModuleUnload(ffn IQ4_XS)");
+        check(handle_, module_unload(tail_module),
+              "cuModuleUnload(attention tail)");
+        check(handle_, module_unload(gdn_module),
+              "cuModuleUnload(front GDN)");
+        check(handle_, module_unload(prep_module),
+              "cuModuleUnload(front prep)");
+        check(handle_, module_unload(q4_module),
+              "cuModuleUnload(front Q4)");
+        check(handle_, module_unload(q5_module),
+              "cuModuleUnload(front Q5)");
+        check(handle_, module_unload(norm_module),
+              "cuModuleUnload(front RMSNorm)");
+
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 bool NvidiaDriver::run_qwen35_layer0_recurrent_attention(
     const float* norm_weight,
     const std::byte* qkv_matrix,
