@@ -751,6 +751,272 @@ GDN_DONE:
 }
 )ptx";
 
+constexpr const char* kRecurrentPrepPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_conv4_silu_roll(
+    .param .u64 p_qkv,
+    .param .u64 p_weight,
+    .param .u64 p_state_in,
+    .param .u64 p_conv_out,
+    .param .u64 p_state_out,
+    .param .u32 p_channels,
+    .param .f32 p_log2e
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<24>;
+
+    ld.param.u64 %rd1, [p_qkv];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_state_in];
+    ld.param.u64 %rd4, [p_conv_out];
+    ld.param.u64 %rd5, [p_state_out];
+    ld.param.u32 %r1, [p_channels];
+    ld.param.f32 %f1, [p_log2e];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra C4_DONE;
+
+    mul.wide.u32 %rd6, %r5, 4;
+
+    // state layout [3][channels]
+    add.s64 %rd7, %rd3, %rd6;
+    ld.global.f32 %f2, [%rd7];
+
+    mul.wide.u32 %rd8, %r1, 4;
+    add.s64 %rd9, %rd7, %rd8;
+    ld.global.f32 %f3, [%rd9];
+    add.s64 %rd10, %rd9, %rd8;
+    ld.global.f32 %f4, [%rd10];
+
+    add.s64 %rd11, %rd1, %rd6;
+    ld.global.f32 %f5, [%rd11];
+
+    // weight layout [4,channels] with conv step contiguous:
+    // address = (channel*4 + step)*4
+    shl.b32 %r6, %r5, 2;
+    mul.wide.u32 %rd12, %r6, 4;
+    add.s64 %rd13, %rd2, %rd12;
+    ld.global.v4.f32 {%f6,%f7,%f8,%f9}, [%rd13];
+
+    mul.rn.f32 %f10, %f2, %f6;
+    fma.rn.f32 %f10, %f3, %f7, %f10;
+    fma.rn.f32 %f10, %f4, %f8, %f10;
+    fma.rn.f32 %f10, %f5, %f9, %f10;
+
+    // SiLU(x)=x*sigmoid(x), sigmoid via exp2.
+    neg.f32 %f11, %f10;
+    mul.rn.f32 %f11, %f11, %f1;
+    ex2.approx.f32 %f12, %f11;
+    add.rn.f32 %f12, %f12, 0f3F800000;
+    rcp.approx.f32 %f13, %f12;
+    mul.rn.f32 %f14, %f10, %f13;
+
+    add.s64 %rd14, %rd4, %rd6;
+    st.global.f32 [%rd14], %f14;
+
+    // roll state: [x1,x2,x3]
+    add.s64 %rd15, %rd5, %rd6;
+    st.global.f32 [%rd15], %f3;
+    add.s64 %rd16, %rd15, %rd8;
+    st.global.f32 [%rd16], %f4;
+    add.s64 %rd17, %rd16, %rd8;
+    st.global.f32 [%rd17], %f5;
+
+C4_DONE:
+    ret;
+}
+
+.visible .entry q38_qk_l2norm_128(
+    .param .u64 p_conv,
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .f32 p_eps
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .shared .align 4 .b8 smem[512];
+
+    ld.param.u64 %rd1, [p_conv];
+    ld.param.u64 %rd2, [p_q];
+    ld.param.u64 %rd3, [p_k];
+    ld.param.f32 %f1, [p_eps];
+
+    mov.u32 %r1, %ctaid.x; // 0..31
+    mov.u32 %r2, %tid.x;   // 0..127
+    setp.ge.u32 %p1, %r2, 128;
+    @%p1 bra QKN_DONE;
+
+    setp.lt.u32 %p2, %r1, 16;
+    @%p2 mov.u32 %r3, %r1;
+    @!%p2 sub.u32 %r3, %r1, 16;
+
+    shl.b32 %r4, %r3, 7;   // head*128
+    add.u32 %r4, %r4, %r2;
+    @!%p2 add.u32 %r4, %r4, 2048;
+
+    mul.wide.u32 %rd4, %r4, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    ld.global.f32 %f2, [%rd5];
+    mul.rn.f32 %f3, %f2, %f2;
+
+    mov.u64 %rd6, smem;
+    mul.wide.u32 %rd7, %r2, 4;
+    add.s64 %rd8, %rd6, %rd7;
+    st.shared.f32 [%rd8], %f3;
+    bar.sync 0;
+
+    // binary shared reduction 128 -> 1
+    setp.ge.u32 %p3, %r2, 64;
+    @%p3 bra R64_END;
+    ld.shared.f32 %f4, [%rd8];
+    ld.shared.f32 %f5, [%rd8+256];
+    add.rn.f32 %f4, %f4, %f5;
+    st.shared.f32 [%rd8], %f4;
+R64_END:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r2, 32;
+    @%p4 bra R32_END;
+    ld.shared.f32 %f4, [%rd8];
+    ld.shared.f32 %f5, [%rd8+128];
+    add.rn.f32 %f4, %f4, %f5;
+    st.shared.f32 [%rd8], %f4;
+R32_END:
+    bar.sync 0;
+
+    // warp shuffle reduction for first 32
+    setp.ge.u32 %p5, %r2, 32;
+    @%p5 bra QKN_SCALE;
+    ld.shared.f32 %f6, [%rd8];
+    mov.b32 %r8, %f6;
+    shfl.sync.down.b32 %r9, %r8, 16, 31, 0xffffffff;
+    mov.b32 %f7, %r9;
+    add.rn.f32 %f6, %f6, %f7;
+    mov.b32 %r8, %f6;
+    shfl.sync.down.b32 %r9, %r8, 8, 31, 0xffffffff;
+    mov.b32 %f7, %r9;
+    add.rn.f32 %f6, %f6, %f7;
+    mov.b32 %r8, %f6;
+    shfl.sync.down.b32 %r9, %r8, 4, 31, 0xffffffff;
+    mov.b32 %f7, %r9;
+    add.rn.f32 %f6, %f6, %f7;
+    mov.b32 %r8, %f6;
+    shfl.sync.down.b32 %r9, %r8, 2, 31, 0xffffffff;
+    mov.b32 %f7, %r9;
+    add.rn.f32 %f6, %f6, %f7;
+    mov.b32 %r8, %f6;
+    shfl.sync.down.b32 %r9, %r8, 1, 31, 0xffffffff;
+    mov.b32 %f7, %r9;
+    add.rn.f32 %f6, %f6, %f7;
+
+    setp.ne.u32 %p6, %r2, 0;
+    @%p6 bra QKN_SCALE;
+    add.rn.f32 %f6, %f6, %f1;
+    rsqrt.approx.f32 %f8, %f6;
+    st.shared.f32 [smem], %f8;
+
+QKN_SCALE:
+    bar.sync 0;
+    ld.shared.f32 %f9, [smem];
+    mul.rn.f32 %f10, %f2, %f9;
+
+    // output head-contiguous without k offset
+    shl.b32 %r10, %r3, 7;
+    add.u32 %r10, %r10, %r2;
+    mul.wide.u32 %rd9, %r10, 4;
+    @%p2 add.s64 %rd10, %rd2, %rd9;
+    @!%p2 add.s64 %rd10, %rd3, %rd9;
+    st.global.f32 [%rd10], %f10;
+
+QKN_DONE:
+    ret;
+}
+
+.visible .entry q38_beta_gate_48(
+    .param .u64 p_beta_raw,
+    .param .u64 p_alpha_raw,
+    .param .u64 p_dt,
+    .param .u64 p_a,
+    .param .u64 p_beta_out,
+    .param .u64 p_gate_out,
+    .param .f32 p_log2e,
+    .param .f32 p_inv_log2e
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<24>;
+
+    ld.param.u64 %rd1, [p_beta_raw];
+    ld.param.u64 %rd2, [p_alpha_raw];
+    ld.param.u64 %rd3, [p_dt];
+    ld.param.u64 %rd4, [p_a];
+    ld.param.u64 %rd5, [p_beta_out];
+    ld.param.u64 %rd6, [p_gate_out];
+    ld.param.f32 %f1, [p_log2e];
+    ld.param.f32 %f2, [p_inv_log2e];
+
+    mov.u32 %r1, %tid.x;
+    setp.ge.u32 %p1, %r1, 48;
+    @%p1 bra BG_DONE;
+
+    mul.wide.u32 %rd7, %r1, 4;
+    add.s64 %rd8, %rd1, %rd7;
+    add.s64 %rd9, %rd2, %rd7;
+    add.s64 %rd10, %rd3, %rd7;
+    add.s64 %rd11, %rd4, %rd7;
+
+    ld.global.f32 %f3, [%rd8];
+    ld.global.f32 %f4, [%rd9];
+    ld.global.f32 %f5, [%rd10];
+    ld.global.f32 %f6, [%rd11];
+
+    // beta sigmoid
+    neg.f32 %f7, %f3;
+    mul.rn.f32 %f7, %f7, %f1;
+    ex2.approx.f32 %f8, %f7;
+    add.rn.f32 %f8, %f8, 0f3F800000;
+    rcp.approx.f32 %f9, %f8;
+
+    add.s64 %rd12, %rd5, %rd7;
+    st.global.f32 [%rd12], %f9;
+
+    // softplus(alpha + dt), stable branch for large positive values.
+    add.rn.f32 %f10, %f4, %f5;
+    setp.gt.f32 %p2, %f10, 20f;
+    @%p2 mov.f32 %f14, %f10;
+    @%p2 bra BG_SP_DONE;
+
+    mul.rn.f32 %f11, %f10, %f1;
+    ex2.approx.f32 %f12, %f11;
+    add.rn.f32 %f12, %f12, 0f3F800000;
+    lg2.approx.f32 %f13, %f12;
+    mul.rn.f32 %f14, %f13, %f2;
+
+BG_SP_DONE:
+    mul.rn.f32 %f15, %f14, %f6;
+    add.s64 %rd13, %rd6, %rd7;
+    st.global.f32 [%rd13], %f15;
+
+BG_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ4KDequantPtx = R"ptx(
 .version 7.1
 .target sm_86
