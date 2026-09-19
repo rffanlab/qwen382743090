@@ -985,9 +985,10 @@ constexpr const char* kQ5KQ8KDp4aGemvPtx = R"ptx(
 .target sm_86
 .address_size 64
 
-// One warp computes four output rows.
-// Each 8-lane subgroup owns one row. Every lane packs four Q5 bytes and
-// four signed Q8 bytes, then dp4a computes four products at once.
+// One warp computes one output row.
+// The warp is split into four 8-lane subgroups. In pass 0 they process Q5_K
+// groups 0..3; in pass 1 they process groups 4..7. Each subgroup lane packs
+// four Q5 bytes and four signed Q8 bytes and uses one dp4a instruction.
 .visible .entry q38_q5k_q8k_dp4a_gemv(
     .param .u64 p_weights,
     .param .u64 p_q8,
@@ -996,10 +997,10 @@ constexpr const char* kQ5KQ8KDp4aGemvPtx = R"ptx(
     .param .u32 p_rows
 )
 {
-    .reg .pred %p<20>;
-    .reg .b32 %r<80>;
-    .reg .b64 %rd<36>;
-    .reg .f32 %f<24>;
+    .reg .pred %p<24>;
+    .reg .b32 %r<88>;
+    .reg .b64 %rd<40>;
+    .reg .f32 %f<28>;
 
     ld.param.u64 %rd1, [p_weights];
     ld.param.u64 %rd2, [p_q8];
@@ -1007,68 +1008,66 @@ constexpr const char* kQ5KQ8KDp4aGemvPtx = R"ptx(
     ld.param.u32 %r1, [p_cols];
     ld.param.u32 %r2, [p_rows];
 
-    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r3, %ctaid.x;       // output row
     mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 3;        // subgroup 0..3
+    and.b32 %r6, %r4, 7;        // lane in subgroup 0..7
 
-    shr.u32 %r5, %r4, 3;      // subgroup row 0..3
-    and.b32 %r6, %r4, 7;      // lane within subgroup 0..7
-    shl.b32 %r7, %r3, 2;
-    add.u32 %r7, %r7, %r5;    // absolute output row
-
-    setp.ge.u32 %p1, %r7, %r2;
+    setp.ge.u32 %p1, %r3, %r2;
     @%p1 bra DP4A_DONE;
 
-    shr.u32 %r8, %r1, 8;      // blocks_per_row = cols / 256
-    mul.lo.u32 %r9, %r8, 176;
-    mul.wide.u32 %rd4, %r7, %r9;
-    add.s64 %rd5, %rd1, %rd4; // row weight base
+    shr.u32 %r7, %r1, 8;        // blocks_per_row = cols / 256
+    mul.lo.u32 %r8, %r7, 176;
+    mul.wide.u32 %rd4, %r3, %r8;
+    add.s64 %rd5, %rd1, %rd4;  // row weight base
 
-    mov.u32 %r10, 0;          // block index
-    mov.f32 %f15, 0f00000000; // valid in subgroup leaders
+    mov.u32 %r9, 0;             // block index
+    mov.f32 %f15, 0f00000000;   // subgroup-leader accumulator
 
 DP4A_BLOCK_LOOP:
-    setp.ge.u32 %p2, %r10, %r8;
+    setp.ge.u32 %p2, %r9, %r7;
     @%p2 bra DP4A_BLOCKS_DONE;
 
-    mul.wide.u32 %rd6, %r10, 176;
+    mul.wide.u32 %rd6, %r9, 176;
     add.s64 %rd7, %rd5, %rd6;  // Q5 block
 
-    mul.wide.u32 %rd8, %r10, 292;
+    mul.wide.u32 %rd8, %r9, 292;
     add.s64 %rd9, %rd2, %rd8;  // Q8 block
 
-    // Each subgroup lane owns four consecutive positions in a 32-value group.
-    // Cache four qh bytes once; their eight bits are reused by all groups.
-    shl.b32 %r11, %r6, 2;       // sublane * 4
-    cvt.u64.u32 %rd10, %r11;
+    // Four qh bytes per subgroup lane. All four subgroups stay on the same
+    // Q5 row/block, preserving row-local/coalesced access.
+    shl.b32 %r10, %r6, 2;       // sublane * 4
+    cvt.u64.u32 %rd10, %r10;
     add.s64 %rd11, %rd7, 16;
     add.s64 %rd12, %rd11, %rd10;
-    ld.global.b32 %r40, [%rd12]; // four qh bytes
+    ld.global.b32 %r40, [%rd12];
 
-    mov.u32 %r12, 0;             // group 0..7
+    mov.u32 %r11, 0;            // pass 0..1
 
-DP4A_GROUP_LOOP:
-    setp.ge.u32 %p3, %r12, 8;
-    @%p3 bra DP4A_GROUPS_DONE;
+DP4A_PASS_LOOP:
+    setp.ge.u32 %p3, %r11, 2;
+    @%p3 bra DP4A_PASSES_DONE;
 
-    // ql storage is shared by pairs of groups. Load four bytes on even group,
-    // keep the register for the following odd group.
+    // group = subgroup + pass*4
+    shl.b32 %r12, %r11, 2;
+    add.u32 %r12, %r12, %r5;
+
+    // ql pair storage, four bytes per subgroup lane.
     shr.u32 %r13, %r12, 1;
-    shl.b32 %r13, %r13, 5;       // pair * 32
-    add.u32 %r13, %r13, %r11;    // + sublane*4
+    shl.b32 %r13, %r13, 5;      // pair * 32
+    add.u32 %r13, %r13, %r10;   // + sublane * 4
     cvt.u64.u32 %rd13, %r13;
     add.s64 %rd14, %rd7, 48;
     add.s64 %rd15, %rd14, %rd13;
+    ld.global.b32 %r41, [%rd15];
 
     and.b32 %r14, %r12, 1;
     setp.eq.u32 %p4, %r14, 0;
-    @%p4 ld.global.b32 %r41, [%rd15];
-
-    // Expand four 4-bit values into four unsigned bytes.
     @%p4 and.b32 %r42, %r41, 0x0f0f0f0f;
     @!%p4 shr.u32 %r42, %r41, 4;
     @!%p4 and.b32 %r42, %r42, 0x0f0f0f0f;
 
-    // Add Q5's fifth bit into bit4 of every byte.
+    // Add the Q5 fifth bit into bit4 of each packed byte.
     mov.u32 %r43, 0x01010101;
     shl.b32 %r43, %r43, %r12;
     and.b32 %r44, %r40, %r43;
@@ -1078,11 +1077,12 @@ DP4A_GROUP_LOOP:
     @%p5 shl.b32 %r44, %r44, %r45;
     @!%p5 sub.u32 %r45, %r12, 4;
     @!%p5 shr.u32 %r44, %r44, %r45;
-    or.b32 %r42, %r42, %r44;     // packed four unsigned Q5 values
+    or.b32 %r42, %r42, %r44;
 
-    // Four signed Q8 values for this group/subgroup lane.
-    shl.b32 %r46, %r12, 5;       // group * 32
-    add.u32 %r46, %r46, %r11;
+    // Four signed Q8 values. Across the whole warp pass 0 reads groups 0..3
+    // (128 contiguous bytes); pass 1 reads groups 4..7 (next 128 bytes).
+    shl.b32 %r46, %r12, 5;
+    add.u32 %r46, %r46, %r10;
     cvt.u64.u32 %rd16, %r46;
     add.s64 %rd17, %rd9, 4;
     add.s64 %rd18, %rd17, %rd16;
@@ -1091,7 +1091,7 @@ DP4A_GROUP_LOOP:
     mov.s32 %r48, 0;
     dp4a.u32.s32 %r48, %r42, %r47, %r48;
 
-    // 8-lane subgroup reduction. XOR 4/2/1 never crosses an 8-lane boundary.
+    // Independent 8-lane subgroup reduction.
     shfl.sync.bfly.b32 %r49, %r48, 4, 31, 0xffffffff;
     add.s32 %r48, %r48, %r49;
     shfl.sync.bfly.b32 %r49, %r48, 2, 31, 0xffffffff;
@@ -1099,17 +1099,15 @@ DP4A_GROUP_LOOP:
     shfl.sync.bfly.b32 %r49, %r48, 1, 31, 0xffffffff;
     add.s32 %r48, %r48, %r49;
 
-    // Only subgroup leader applies floating scales/min correction.
     setp.ne.u32 %p6, %r6, 0;
-    @%p6 bra DP4A_NEXT_GROUP;
+    @%p6 bra DP4A_NEXT_PASS;
 
-    // Q5 d / dmin.
+    // Only subgroup leaders need floating metadata/correction.
     ld.global.b16 %r50, [%rd7+0];
     ld.global.b16 %r51, [%rd7+2];
     cvt.f32.f16 %f1, %r50;
     cvt.f32.f16 %f2, %r51;
 
-    // Decode scale/min for group r12.
     add.s64 %rd19, %rd7, 4;
     setp.lt.u32 %p7, %r12, 4;
     @%p7 bra DP4A_SCALE_LOW;
@@ -1152,8 +1150,8 @@ DP4A_SCALE_LOW:
     and.b32 %r62, %r55, 63;
 
 DP4A_SCALE_READY:
-    // Q8 scale and sum of its two 16-value bsums for this 32-value group.
     ld.global.f32 %f3, [%rd9+0];
+
     shl.b32 %r63, %r12, 2;
     cvt.u64.u32 %rd26, %r63;
     add.s64 %rd27, %rd9, 260;
@@ -1175,26 +1173,40 @@ DP4A_SCALE_READY:
     mul.rn.f32 %f13, %f3, %f12;
     add.rn.f32 %f15, %f15, %f13;
 
-DP4A_NEXT_GROUP:
-    add.u32 %r12, %r12, 1;
-    bra DP4A_GROUP_LOOP;
+DP4A_NEXT_PASS:
+    add.u32 %r11, %r11, 1;
+    bra DP4A_PASS_LOOP;
 
-DP4A_GROUPS_DONE:
-    add.u32 %r10, %r10, 1;
+DP4A_PASSES_DONE:
+    add.u32 %r9, %r9, 1;
     bra DP4A_BLOCK_LOOP;
 
 DP4A_BLOCKS_DONE:
-    setp.ne.u32 %p8, %r6, 0;
+    // Subgroup leaders are lanes 0,8,16,24. Gather their two-group partial
+    // sums to lane 0 with register shuffles; no global/shared atomics.
+    mov.b32 %r70, %f15;
+    shfl.sync.idx.b32 %r71, %r70, 8, 31, 0xffffffff;
+    shfl.sync.idx.b32 %r72, %r70, 16, 31, 0xffffffff;
+    shfl.sync.idx.b32 %r73, %r70, 24, 31, 0xffffffff;
+
+    setp.ne.u32 %p8, %r4, 0;
     @%p8 bra DP4A_DONE;
-    mul.wide.u32 %rd29, %r7, 4;
+
+    mov.b32 %f16, %r71;
+    mov.b32 %f17, %r72;
+    mov.b32 %f18, %r73;
+    add.rn.f32 %f19, %f15, %f16;
+    add.rn.f32 %f19, %f19, %f17;
+    add.rn.f32 %f19, %f19, %f18;
+
+    mul.wide.u32 %rd29, %r3, 4;
     add.s64 %rd30, %rd3, %rd29;
-    st.global.f32 [%rd30], %f15;
+    st.global.f32 [%rd30], %f19;
 
 DP4A_DONE:
     ret;
 }
 )ptx";
-
 } // namespace
 
 NvidiaDriver::~NvidiaDriver() { close(); }
