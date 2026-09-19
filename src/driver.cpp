@@ -1306,6 +1306,10 @@ Q6_BLOCK_LOOP:
     ld.global.b16 %r41, [%rd9+2];
     ld.global.b16 %r42, [%rd9+4];
     ld.global.b16 %r43, [%rd9+6];
+    and.b32 %r40, %r40, 0x0000ffff;
+    and.b32 %r41, %r41, 0x0000ffff;
+    and.b32 %r42, %r42, 0x0000ffff;
+    and.b32 %r43, %r43, 0x0000ffff;
     shl.b32 %r84, %r41, 16;
     or.b32 %r40, %r40, %r84;
     shl.b32 %r84, %r43, 16;
@@ -1323,6 +1327,10 @@ Q6_BLOCK_LOOP:
     ld.global.b16 %r43, [%rd12+2];
     ld.global.b16 %r85, [%rd12+4];
     ld.global.b16 %r86, [%rd12+6];
+    and.b32 %r42, %r42, 0x0000ffff;
+    and.b32 %r43, %r43, 0x0000ffff;
+    and.b32 %r85, %r85, 0x0000ffff;
+    and.b32 %r86, %r86, 0x0000ffff;
     shl.b32 %r84, %r43, 16;
     or.b32 %r42, %r42, %r84;
     shl.b32 %r84, %r86, 16;
