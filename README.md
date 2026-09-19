@@ -369,3 +369,35 @@ The SM86 benchmark reports both:
     physical_repacked_bandwidth_GBps
 
 The first is the apples-to-apples metric against the 250.8580 GB/s GGUF-layout baseline. The second shows actual bytes consumed by the repacked layout. Q38PACK v2 will only be made persistent if the original-equivalent throughput improves enough to justify the small size cost.
+
+
+## 真实 layer 0：RMSNorm → attn_gate
+
+在持久化 Q38PACK v2 上，可以直接跑 Qwen3.8 第 0 层真实执行链的前两步：
+
+    ./build/q38-layer0-gate --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+该测试使用真实模型 tensor：
+
+    blk.0.attn_norm.weight     F32 / GGUF_NATIVE / [5120]
+    blk.0.attn_gate.weight     Q5_K / SM86_Q5K_SOA / [5120,6144]
+
+执行顺序与 Qwen35/Qwen3.8 recurrent layer graph 一致：
+
+    synthetic hidden[5120]
+        ↓
+    RMSNorm(real attn_norm.weight, eps=1e-6)
+        ↓
+    SM86 Q5_K SoA GEMV(real attn_gate.weight)
+        ↓
+    gate projection[6144]
+
+CPU reference 使用相同真实 norm/Q5_K 权重验证前 8 个输出行。输出包含：
+
+    rmsnorm_ms
+    attn_gate_projection_ms
+    attn_gate_original_equiv_GBps
+    chain_ms
+    chain_equiv_calls_per_second
+
+这个 target 的意义是从“单算子 benchmark”跨到真实 Qwen3.8 layer execution。下一阶段会把 blk.0 的 qkv、beta、alpha、DeltaNet state 与 FFN 继续接入同一个 Layer Executor。
