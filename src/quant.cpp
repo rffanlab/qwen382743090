@@ -182,6 +182,72 @@ void dequantize_q5_k_block_cpu(const std::byte* block, std::array<float, kQ4KVal
     }
 }
 
+
+void dequantize_q6_k_block_cpu(
+    const std::byte* block,
+    std::array<float, kQ4KValuesPerBlock>& out) {
+    if (!block) throw std::invalid_argument("Q6_K block is null");
+
+    // GGML block_q6_K layout:
+    // ql[128], qh[64], scales[16], fp16 d.
+    const auto* ql =
+        reinterpret_cast<const std::uint8_t*>(block + 0);
+    const auto* qh =
+        reinterpret_cast<const std::uint8_t*>(block + 128);
+    const auto* sc =
+        reinterpret_cast<const std::int8_t*>(block + 192);
+
+    std::uint16_t d_bits{};
+    std::memcpy(&d_bits, block + 208, sizeof(d_bits));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    d_bits = __builtin_bswap16(d_bits);
+#endif
+    const float d = fp16_to_fp32(d_bits);
+
+    std::size_t out_base = 0;
+    for (int half = 0; half < 2; ++half) {
+        const auto* ql_half = ql + half * 64;
+        const auto* qh_half = qh + half * 32;
+        const auto* sc_half = sc + half * 8;
+
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            const std::uint8_t hv = qh_half[l];
+
+            const int q1 =
+                static_cast<int>(
+                    (ql_half[l + 0] & 0x0f) |
+                    (((hv >> 0) & 0x03) << 4)) - 32;
+            const int q2 =
+                static_cast<int>(
+                    (ql_half[l + 32] & 0x0f) |
+                    (((hv >> 2) & 0x03) << 4)) - 32;
+            const int q3 =
+                static_cast<int>(
+                    (ql_half[l + 0] >> 4) |
+                    (((hv >> 4) & 0x03) << 4)) - 32;
+            const int q4 =
+                static_cast<int>(
+                    (ql_half[l + 32] >> 4) |
+                    (((hv >> 6) & 0x03) << 4)) - 32;
+
+            out[out_base + l + 0] =
+                d * static_cast<float>(sc_half[is + 0]) *
+                static_cast<float>(q1);
+            out[out_base + l + 32] =
+                d * static_cast<float>(sc_half[is + 2]) *
+                static_cast<float>(q2);
+            out[out_base + l + 64] =
+                d * static_cast<float>(sc_half[is + 4]) *
+                static_cast<float>(q3);
+            out[out_base + l + 96] =
+                d * static_cast<float>(sc_half[is + 6]) *
+                static_cast<float>(q4);
+        }
+        out_base += 128;
+    }
+}
+
 namespace {
 
 int nearest_int_q38(float fval) noexcept {
