@@ -273,4 +273,44 @@ void dequantize_q5_k_sm86_block_cpu(const std::byte* block, std::array<float, kQ
     }
 }
 
+void dequantize_iq4_xs_block_cpu(const std::byte* block, std::array<float, kQ4KValuesPerBlock>& out) {
+    if (!block) throw std::invalid_argument("IQ4_XS block is null");
+
+    static constexpr std::array<std::int8_t, 16> kValues{
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113,
+    };
+
+    std::uint16_t d_bits{};
+    std::uint16_t scales_h{};
+    std::memcpy(&d_bits, block + 0, sizeof(d_bits));
+    std::memcpy(&scales_h, block + 2, sizeof(scales_h));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    d_bits = __builtin_bswap16(d_bits);
+    scales_h = __builtin_bswap16(scales_h);
+#endif
+
+    const float d = fp16_to_fp32(d_bits);
+    const auto* scales_l = reinterpret_cast<const std::uint8_t*>(block + 4);
+    const auto* qs = reinterpret_cast<const std::uint8_t*>(block + 8);
+
+    std::size_t out_pos = 0;
+    for (int group = 0; group < 8; ++group) {
+        const int low4 =
+            (scales_l[group / 2] >> (4 * (group % 2))) & 0x0f;
+        const int high2 = (scales_h >> (2 * group)) & 0x03;
+        const int ls = low4 | (high2 << 4);
+        const float dl = d * static_cast<float>(ls - 32);
+
+        const auto* q = qs + group * 16;
+        for (int j = 0; j < 16; ++j) {
+            out[out_pos + j] =
+                dl * static_cast<float>(kValues[q[j] & 0x0f]);
+            out[out_pos + 16 + j] =
+                dl * static_cast<float>(kValues[q[j] >> 4]);
+        }
+        out_pos += 32;
+    }
+}
+
 } // namespace q38
