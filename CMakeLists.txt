@@ -33,6 +33,9 @@ target_link_libraries(q38-rmsnorm-smoke PRIVATE q38rt)
 add_executable(q38-q4k-smoke src/q4k_smoke.cpp)
 target_link_libraries(q38-q4k-smoke PRIVATE q38rt)
 
+add_executable(q38-q5k-smoke src/q5k_smoke.cpp)
+target_link_libraries(q38-q5k-smoke PRIVATE q38rt)
+
 if(Q38_BUILD_TESTS)
   enable_testing()
   add_executable(q38pack-smoke tests/q38pack_smoke.cpp)
