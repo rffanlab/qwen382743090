@@ -1020,3 +1020,68 @@ post-attention RMSNorm + dense FFN + final residual:
         -> SiLU(gate) * up
         -> ffn_down  Q5_K   / Q5K_SM86_VEC
         -> residual
+
+
+### Recurrent attention result
+
+The complete layer0 recurrent-attention branch is validated on RTX 3090:
+
+    recurrent_front_ms:           0.1620
+    gated_norm_ms:                0.0023
+    ssm_out_ms:                   0.0428
+    attention_tail_ms:            0.0469
+    recurrent_attention_chain_ms: 0.2089
+
+Correctness:
+
+    gated_norm_max_abs_error: 1.192093e-06
+    ssm_out_max_abs_error:    1.913037e-07
+    residual_max_abs_error:   1.913037e-07
+
+The measured stage sum and integrated chain are both 0.2089 ms, so the
+attention branch currently has effectively no extra composition overhead.
+
+### Complete recurrent layer0
+
+The Runtime now appends the dense FFN to the validated recurrent attention:
+
+    attention residual[5120]
+        -> post_attention_norm RMSNorm
+        -> ffn_gate [5120,17408] via IQ4XS_PRMT
+        -> ffn_up   [5120,17408] via Q5K_SM86_VEC
+        -> SiLU(gate) * up
+        -> ffn_down [17408,5120] via Q5K_SM86_VEC
+        -> add attention residual
+        -> complete layer0 output[5120]
+
+The only new arithmetic kernel is a thin F32 pointwise
+`SiLU(gate) * up`; all projection kernels reuse the retained optimized paths.
+
+Integrated correctness validates:
+
+    post-attention RMSNorm: all 5120 values
+    SiLU(gate) * up:       all 17408 values
+    ffn_down:               real Q5 CPU-reference output rows
+    final layer residual:   corresponding output rows
+
+The already validated attention-chain checks remain active inside the full-layer
+test.
+
+Run:
+
+    ./build/q38-layer0-full --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+The benchmark reports:
+
+    attention_ms
+    post_norm_ms
+    ffn_gate_ms
+    ffn_up_ms
+    ffn_pointwise_ms
+    ffn_down_ms
+    ffn_ms
+    sum_stage_ms
+    layer_chain_ms
+
+Weight upload and PTX JIT are excluded from timing. The target is single-token
+decode only; prefill/chunked GDN remains separate future work.
