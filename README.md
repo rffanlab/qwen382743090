@@ -669,3 +669,54 @@ Expected output labels:
 
     kernel_mapping: 4warps_per_cta_8x4lane_prmt
     decode: prmt_byte_permute_8weights_per_lane
+
+
+### IQ4_XS PRMT result: 553 GB/s
+
+The vectorized native IQ4_XS kernel is the retained implementation.
+
+Real RTX 3090 result on `blk.0.ffn_gate.weight [5120,17408]`:
+
+    previous native:
+      0.2373 ms
+      199.5655 GB/s
+
+    four-warp CTA only:
+      0.2340 ms
+      202.3305 GB/s
+
+    PRMT-vectorized native IQ4_XS:
+      0.0855 ms
+      553.5147 GB/s
+
+Correctness:
+
+    max_abs_error: 1.091286e-07
+    max_rel_error: 4.312929e-06
+
+The winning mapping keeps GGUF-native IQ4_XS on disk. Eight 4-lane subgroups
+cover the eight 32-value groups, each lane decodes eight weights with
+`prmt.b32`, and group scale is applied after subgroup reduction.
+
+The rejected SM86 IQ4_XS SoA and Q8_1/DP4A experiments remain documented but
+are not part of the runtime path.
+
+### Vectorized Q5_K SoA follow-up
+
+Because Q5_K is the dominant model storage class, the same execution strategy
+is now being tested on persistent `SM86_Q5K_SOA`:
+
+    one CTA = four warps
+    one warp = one output row
+    eight 4-lane subgroups = eight Q5_K groups
+    each lane = eight weights
+    d/scale and dmin/min are applied after the subgroup reduction
+
+Run:
+
+    ./build/q38-q5k-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+Expected labels:
+
+    kernel_mapping: 4warps_per_cta_8x4lane_groups
+    decode: 8weights_per_lane_group_scale_after_reduction
