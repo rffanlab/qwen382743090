@@ -33,6 +33,16 @@ struct GdnArSmokeStats {
     double state_bandwidth_gbps{};
 };
 
+struct Layer0RecurrentAttentionStats {
+    double gated_norm_max_abs{};
+    double ssm_out_max_abs{};
+    double residual_max_abs{};
+    double gated_norm_ms{};
+    double ssm_out_ms{};
+    double tail_ms{};
+    double chain_ms{};
+};
+
 struct Layer0RecurrentFrontStats {
     double conv_max_abs{};
     double q_max_abs{};
@@ -98,6 +108,27 @@ public:
     bool run_q5k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_q8k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_sm86_gemv_smoke(const std::byte* repacked_matrix, std::size_t qh_offset, std::size_t qs_offset, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* original_equiv_gbps = nullptr, double* physical_gbps = nullptr);
+    bool run_qwen35_layer0_recurrent_attention(
+        const float* norm_weight,
+        const std::byte* qkv_matrix,
+        std::size_t qkv_qh_offset,
+        std::size_t qkv_qs_offset,
+        const std::byte* z_matrix,
+        std::size_t z_qh_offset,
+        std::size_t z_qs_offset,
+        const std::byte* beta_matrix,
+        const std::byte* alpha_matrix,
+        const float* conv_weight,
+        const float* dt_bias,
+        const float* ssm_a,
+        const float* ssm_norm_weight,
+        const std::byte* ssm_out_matrix,
+        std::size_t ssm_out_qh_offset,
+        std::size_t ssm_out_qs_offset,
+        float rms_eps,
+        Layer0RecurrentAttentionStats* stats = nullptr,
+        std::string* error = nullptr);
+
     bool run_qwen35_layer0_recurrent_front(
         const float* norm_weight,
         const std::byte* qkv_matrix,
