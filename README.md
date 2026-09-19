@@ -284,3 +284,37 @@ so one lane computes four integer products per instruction. XOR warp shuffles re
 Run the retained F32 baseline and the new DP4A path back-to-back:
 
     ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack && ./build/q38-q5k-q8k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+
+### Rejected DP4A mapping: one warp across four rows
+
+Real RTX 3090 result:
+
+    F32 v2:        0.0864 ms / 250.3453 GB/s
+    Q8_K 4-row:    0.1564 ms / 138.3079 GB/s
+
+The DP4A math remained correct, but splitting one warp across four independent weight rows destroyed the row-local/coalesced weight access that made the F32 baseline relatively fast.
+
+### Row-local DP4A v2
+
+The active Q8_K DP4A kernel now restores one warp per output row while retaining packed integer dot products:
+
+    one warp -> one Q5_K row
+
+    pass 0:
+      lanes  0..7  -> group 0
+      lanes  8..15 -> group 1
+      lanes 16..23 -> group 2
+      lanes 24..31 -> group 3
+
+    pass 1:
+      lanes  0..7  -> group 4
+      lanes  8..15 -> group 5
+      lanes 16..23 -> group 6
+      lanes 24..31 -> group 7
+
+Each 8-lane subgroup processes four values per lane with `dp4a.u32.s32`. At the end, subgroup leaders (lanes 0/8/16/24) are gathered with register shuffles and lane 0 writes the row result. No global atomics are used.
+
+Run:
+
+    ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack && ./build/q38-q5k-q8k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
