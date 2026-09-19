@@ -335,6 +335,115 @@ bool Runtime::run_layer0_recurrent_attention(
     }
 }
 
+
+bool Runtime::run_layer0_full(
+    float rms_eps,
+    Layer0FullStats* stats,
+    std::string* error) {
+    try {
+        if (!driver_.available()) {
+            throw std::runtime_error(
+                "layer0 full requires an initialized GPU driver");
+        }
+
+        auto require = [&](const char* name) -> const TensorRecord& {
+            const auto* tensor = pack_.find_tensor(name);
+            if (!tensor) {
+                throw std::runtime_error(
+                    std::string("missing tensor: ") + name);
+            }
+            return *tensor;
+        };
+
+        const auto& norm       = require("blk.0.attn_norm.weight");
+        const auto& qkv        = require("blk.0.attn_qkv.weight");
+        const auto& z          = require("blk.0.attn_gate.weight");
+        const auto& beta       = require("blk.0.ssm_beta.weight");
+        const auto& alpha      = require("blk.0.ssm_alpha.weight");
+        const auto& conv       = require("blk.0.ssm_conv1d.weight");
+        const auto& dt         = require("blk.0.ssm_dt.bias");
+        const auto& a          = require("blk.0.ssm_a");
+        const auto& ssm_norm   = require("blk.0.ssm_norm.weight");
+        const auto& ssm_out    = require("blk.0.ssm_out.weight");
+        const auto& post_norm  = require("blk.0.post_attention_norm.weight");
+        const auto& ffn_gate   = require("blk.0.ffn_gate.weight");
+        const auto& ffn_up     = require("blk.0.ffn_up.weight");
+        const auto& ffn_down   = require("blk.0.ffn_down.weight");
+
+        if (select_projection_kernel(norm) != ProjectionKernelKind::F32Direct ||
+            select_projection_kernel(qkv) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(z) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(beta) != ProjectionKernelKind::Q4KNative ||
+            select_projection_kernel(alpha) != ProjectionKernelKind::Q4KNative ||
+            select_projection_kernel(ssm_out) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(post_norm) != ProjectionKernelKind::F32Direct ||
+            select_projection_kernel(ffn_gate) != ProjectionKernelKind::IQ4XSPrmt ||
+            select_projection_kernel(ffn_up) != ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(ffn_down) != ProjectionKernelKind::Q5KSm86Vectorized) {
+            throw std::runtime_error(
+                "layer0 full kernel dispatch mismatch");
+        }
+
+        if (conv.ggml_type != 0 || dt.ggml_type != 0 || a.ggml_type != 0 ||
+            ssm_norm.ggml_type != 0 ||
+            conv.layout != TensorLayout::GgufNative ||
+            dt.layout != TensorLayout::GgufNative ||
+            a.layout != TensorLayout::GgufNative ||
+            ssm_norm.layout != TensorLayout::GgufNative) {
+            throw std::runtime_error(
+                "layer0 full F32 tensor layout mismatch");
+        }
+
+        if (norm.dims[0] != 5120 ||
+            qkv.dims[0] != 5120 || qkv.dims[1] != 10240 ||
+            z.dims[0] != 5120 || z.dims[1] != 6144 ||
+            beta.dims[0] != 5120 || beta.dims[1] != 48 ||
+            alpha.dims[0] != 5120 || alpha.dims[1] != 48 ||
+            conv.dims[0] != 4 || conv.dims[1] != 10240 ||
+            dt.dims[0] != 48 || a.dims[0] != 48 ||
+            ssm_norm.dims[0] != 128 ||
+            ssm_out.dims[0] != 6144 || ssm_out.dims[1] != 5120 ||
+            post_norm.dims[0] != 5120 ||
+            ffn_gate.dims[0] != 5120 || ffn_gate.dims[1] != 17408 ||
+            ffn_up.dims[0] != 5120 || ffn_up.dims[1] != 17408 ||
+            ffn_down.dims[0] != 17408 || ffn_down.dims[1] != 5120) {
+            throw std::runtime_error(
+                "layer0 full tensor shapes do not match Qwen3.8-27B");
+        }
+
+        auto qh_off = [](const TensorRecord& t) {
+            return static_cast<std::size_t>(
+                t.aux0_offset - t.data_offset);
+        };
+        auto qs_off = [](const TensorRecord& t) {
+            return static_cast<std::size_t>(
+                t.aux1_offset - t.data_offset);
+        };
+
+        return driver_.run_qwen35_layer0_full(
+            reinterpret_cast<const float*>(pack_.tensor_data(norm)),
+            pack_.tensor_data(qkv), qh_off(qkv), qs_off(qkv),
+            pack_.tensor_data(z), qh_off(z), qs_off(z),
+            pack_.tensor_data(beta),
+            pack_.tensor_data(alpha),
+            reinterpret_cast<const float*>(pack_.tensor_data(conv)),
+            reinterpret_cast<const float*>(pack_.tensor_data(dt)),
+            reinterpret_cast<const float*>(pack_.tensor_data(a)),
+            reinterpret_cast<const float*>(pack_.tensor_data(ssm_norm)),
+            pack_.tensor_data(ssm_out), qh_off(ssm_out), qs_off(ssm_out),
+            reinterpret_cast<const float*>(pack_.tensor_data(post_norm)),
+            pack_.tensor_data(ffn_gate),
+            pack_.tensor_data(ffn_up), qh_off(ffn_up), qs_off(ffn_up),
+            pack_.tensor_data(ffn_down), qh_off(ffn_down), qs_off(ffn_down),
+            rms_eps,
+            stats,
+            error);
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 RuntimeInfo Runtime::info() const {
     RuntimeInfo out;
     out.model_path = model_path_.string();
