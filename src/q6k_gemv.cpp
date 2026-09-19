@@ -74,6 +74,31 @@ int main(int argc, char** argv) {
         driver.open();
         std::cout << "device: " << driver.device_name() << "\n";
 
+        std::string block_error;
+        double block_abs = 0.0;
+        double block_rel = 0.0;
+        std::uint32_t first_bad = 256;
+        const bool block_ok = driver.run_q6k_dequant_smoke(
+            pack.tensor_data(*tensor),
+            &block_error,
+            &block_abs,
+            &block_rel,
+            &first_bad);
+
+        std::cout << std::scientific << std::setprecision(6);
+        std::cout << "block_dequant_max_abs_error: "
+                  << block_abs << "\n";
+        std::cout << "block_dequant_max_rel_error: "
+                  << block_rel << "\n";
+        if (!block_ok) {
+            std::cout << "block_dequant_first_bad_index: "
+                      << first_bad << "\n";
+            std::cerr << "q6_k_block_dequant: FAILED: "
+                      << block_error << "\n";
+            return 6;
+        }
+        std::cout << "q6_k_block_dequant: PASS\n";
+
         std::string error;
         double max_abs = 0.0;
         double max_rel = 0.0;
@@ -91,7 +116,7 @@ int main(int argc, char** argv) {
                 &gbps)) {
             std::cerr << "q6_k_gemv: FAILED: "
                       << error << "\n";
-            return 6;
+            return 7;
         }
 
         std::cout << std::scientific << std::setprecision(6);
