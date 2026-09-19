@@ -1293,6 +1293,9 @@ Q6_BLOCK_LOOP:
     shl.b32 %r18, %r13, 6;     // half ql +0 / +64
     add.u32 %r17, %r17, %r18;
     shl.b32 %r19, %r9, 3;      // sublane * 8
+    and.b32 %r22, %r14, 1;      // which 16-value scale group in pair
+    shl.b32 %r22, %r22, 4;      // +0 / +16
+    add.u32 %r17, %r17, %r22;
     add.u32 %r17, %r17, %r19;
 
     // ql: 8 bytes.
@@ -1303,8 +1306,9 @@ Q6_BLOCK_LOOP:
 
     // qh: half*32 + sublane*8 + group-local 16 offset.
     shl.b32 %r20, %r13, 5;
+    add.u32 %r20, %r20, %r22;
     add.u32 %r20, %r20, %r19;
-    // groups 0/1 share qh bytes; 2/3 etc too. No extra offset by group.
+    // qh byte position follows the same l=0..31 split as ql.
     cvt.u64.u32 %rd10, %r20;
     add.s64 %rd11, %rd7, 128;
     add.s64 %rd12, %rd11, %rd10;
