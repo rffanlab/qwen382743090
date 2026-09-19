@@ -11,6 +11,19 @@ struct ProjectionErrorStats {
     double max_rel{};
 };
 
+struct RecurrentPrepSmokeStats {
+    double conv_max_abs{};
+    double q_max_abs{};
+    double k_max_abs{};
+    double beta_max_abs{};
+    double gate_max_abs{};
+    double conv_state_max_abs{};
+    double conv_silu_ms{};
+    double qk_norm_ms{};
+    double beta_gate_ms{};
+    double chain_ms{};
+};
+
 struct GdnArSmokeStats {
     double output_max_abs{};
     double output_max_rel{};
@@ -96,6 +109,13 @@ public:
         const float* ssm_a,
         float rms_eps,
         Layer0RecurrentFrontStats* stats = nullptr,
+        std::string* error = nullptr);
+
+    bool run_recurrent_prep_smoke(
+        const float* conv_weight,
+        const float* dt_bias,
+        const float* ssm_a,
+        RecurrentPrepSmokeStats* stats = nullptr,
         std::string* error = nullptr);
 
     bool run_gdn_ar_smoke(
