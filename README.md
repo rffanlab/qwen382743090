@@ -318,3 +318,47 @@ Each 8-lane subgroup processes four values per lane with `dp4a.u32.s32`. At the 
 Run:
 
     ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack && ./build/q38-q5k-q8k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+
+### Row-local DP4A result and decision
+
+The row-local DP4A experiment improved substantially over the earlier Q8_K mappings but still lost to the retained F32 path on RTX 3090:
+
+    Q5_K x F32 v2:              0.0862 ms / 250.8580 GB/s
+    Q5_K x Q8_K row-local:     0.1061 ms / 203.8657 GB/s
+
+The Q8_K path is numerically correct, but standard GGUF Q5_K packing still requires too much unpack/reformat work in the hot loop. Further thread-mapping tweaks are no longer the primary optimization path.
+
+### SM86 SoA repack prototype
+
+Before changing Q38PACK on disk, the new experiment repacks only the selected Q5_K tensor in host memory. It preserves the compact 5-bit weights and adds only four metadata bytes per 256-weight block:
+
+    source Q5_K block: 176 bytes
+
+    SM86 prototype logical block:
+      d/dmin                     4 bytes
+      8 x uint16(scale|min)     16 bytes
+      qh                        32 bytes
+      qs                       128 bytes
+      total                    180 bytes
+
+For GPU access the tensor is stored as three structure-of-arrays planes:
+
+    META plane: 20 bytes/block
+    QH plane:   32 bytes/block
+    QS plane:  128 bytes/block
+
+QH therefore has a natural 32-byte stride and QS a natural 128-byte stride. Scale/min no longer needs the original 6-bit metadata decode in the GEMV loop. The size overhead is approximately 2.27% before tiny plane-alignment padding.
+
+The prototype also decodes original Q5_K and repacked blocks on CPU before GPU execution and requires exact decoded-weight equality.
+
+Build and compare against the retained winner:
+
+    ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack && ./build/q38-q5k-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+The SM86 benchmark reports both:
+
+    original_equiv_weight_bandwidth_GBps
+    physical_repacked_bandwidth_GBps
+
+The first is the apples-to-apples metric against the 250.8580 GB/s GGUF-layout baseline. The second shows actual bytes consumed by the repacked layout. Q38PACK v2 will only be made persistent if the original-equivalent throughput improves enough to justify the small size cost.
