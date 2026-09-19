@@ -537,3 +537,66 @@ The SM86 benchmark first requires exact decoded-weight equality, then reports:
 
 Only a meaningful win over the 199.5504 GB/s native baseline will justify
 adding a persistent SM86_IQ4_XS_SOA layout to Q38PACK v2.
+
+
+### IQ4_XS SoA result: rejected
+
+The compact D2/SCALE8/QS128 SoA prototype preserved weights exactly but regressed
+the real RTX 3090 FFN-gate benchmark:
+
+    native IQ4_XS:
+      0.2372 ms
+      199.5919 GB/s
+
+    temporary SM86 SoA:
+      0.2534 ms
+      186.8606 GB/s original-equivalent
+      189.6085 GB/s physical
+      +1.471% size
+
+The SoA layout is therefore rejected and is not persisted in Q38PACK v2.
+IQ4_XS remains GGUF_NATIVE on disk.
+
+### IQ4_XS x Q8_1 DP4A experiment
+
+The next path follows the same arithmetic strategy used by upstream CUDA
+IQ4_XS vector-dot kernels: keep native IQ4_XS weights, quantize the activation
+to standard Q8_1 blocks, turn nonlinear IQ4 codebook values into packed signed
+bytes, and use `dp4a.s32.s32`.
+
+Q8_1 layout:
+
+    32 activation values / block
+    fp16 d
+    fp16 s = d * sum(qs)
+    int8 qs[32]
+    36 bytes total
+
+The first benchmark quantizes activation on CPU before timing so the core GEMV
+can be evaluated independently.
+
+Kernel mapping:
+
+    one warp -> one output row
+
+    pass 0:
+      lanes  0..7  -> IQ4 group 0
+      lanes  8..15 -> IQ4 group 1
+      lanes 16..23 -> IQ4 group 2
+      lanes 24..31 -> IQ4 group 3
+
+    pass 1:
+      lanes  0..7  -> IQ4 group 4
+      lanes  8..15 -> IQ4 group 5
+      lanes 16..23 -> IQ4 group 6
+      lanes 24..31 -> IQ4 group 7
+
+Each subgroup lane processes four weights with one DP4A instruction.
+
+Compare against the native F32 baseline:
+
+    ./build/q38-iq4xs-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack && ./build/q38-iq4xs-q81-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+The Q8_1 benchmark prints `activation_quantization_in_timing: no`. GPU Q8_1
+quantization / RMSNorm fusion will only be implemented if the packed integer
+GEMV materially beats the 199.6 GB/s F32 baseline.
