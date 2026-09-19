@@ -6,40 +6,47 @@
 不依赖 PyTorch、vLLM、CUDA Runtime 或 cuBLAS；热点计算最终使用针对 GA102 固定
 shape 的 PTX/CUBIN，并由我们自己管理模型布局、KV/recurrent state、VMM 和 MTP。
 
-> 当前状态：**M0 已落地**。GGUF → Q38PACK 转换器、C++ mmap runtime/probe、
-> libcuda.so.1 Driver API 探测、OpenAI 兼容 Server 外壳、reference oracle
-> 都已提供。Native Qwen3.8 decode kernel 还没有伪装成“已完成”；接口会明确返回
-> native_decode_not_ready，直到逐层 correctness 验证通过。
+> 当前状态：**Q38PACK v2 / SM86 专用执行格式已经开始落地**。GGUF → Q38PACK v2
+> 会把 Q5_K 持久化重排成 META/QH/QS SoA；RTX 3090 实测在
+> blk.0.attn_gate.weight 上从约 250 GB/s 提升到约 332 GB/s（+32.8%）。
+> Native 完整 Qwen3.8 decode 仍在开发中；未完成的路径不会伪装成可用。
 
 ## 为什么先做自己的 Q38PACK
 
-GGUF 是优秀的通用交换格式，但 Runtime 不应该每次启动都为“通用”付费。Q38PACK v1
-先做两件事：
+GGUF 是优秀的交换格式，但不是 RTX 3090 的最优执行格式。Q38PACK 保持 256-byte tensor directory 和 mmap 启动能力，同时允许每个 tensor 选择自己的执行布局。
 
-- 把 tensor directory 固定成 256-byte entry，启动时直接 mmap；
-- tensor 默认 4 KiB 对齐，为后续 cuMemMap / VMM 和 SM86 专用 repack 留接口。
+当前版本：
 
-v1 **不会重新量化**。GGUF 中的量化 tensor payload 按原字节复制；原始 GGUF metadata
-区也完整保留，因此转换本身不应该引入额外模型误差。
+- v1：GGUF payload 原样保存；
+- v2：Runtime 仍兼容 v1，同时将 Q5_K 持久化为 `SM86_Q5K_SOA`；
+- Q5_K 的 5-bit 权重保持紧凑，只把 scale/min 从 12-byte 6-bit metadata 展成 16 bytes；
+- 真实 3090 测试：标准 Q5_K 约 250.2 GB/s，SM86 SoA 约 332.3 GB/s original-equivalent，decoded weights 不变。
 
-格式见 docs/Q38PACK.md。
+格式见 `docs/Q38PACK.md`。
 
-## 1. GGUF 转 Q38PACK
+## 1. GGUF 转 Q38PACK v2
 
-只需要 Python 3.10+，转换器本身没有第三方依赖。
+v2 是默认格式。Q5_K 的大规模重排使用 NumPy 分块向量化：
 
-    python3 tools/gguf_to_q38pack.py /models/Qwen3.8-27B-Q4_K_M.gguf /models/Qwen3.8-27B-Q4_K_M.q38pack
+    python3 -m pip install numpy
 
-查看结果：
+转换你的主模型：
 
-    python3 tools/inspect_q38pack.py /models/Qwen3.8-27B-Q4_K_M.q38pack
+    python3 tools/gguf_to_q38pack.py ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
 
-需要把所有 tensor 列出来：
+查看布局：
 
-    python3 tools/inspect_q38pack.py /models/Qwen3.8-27B-Q4_K_M.q38pack --tensors
+    python3 tools/inspect_q38pack.py ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
 
-转换器默认允许非 Qwen3.8 GGUF 通过但会在 manifest 中写 warning，方便我们拿合成 GGUF
-和 oracle 做测试。Native Runtime 后续会做严格 model contract 校验。
+    ./build/q38-plan --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --page-bytes 2097152
+
+持久化 v2 Q5_K benchmark（不会启动时再 repack）：
+
+    ./build/q38-q5k-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+需要生成旧 v1 时：
+
+    python3 tools/gguf_to_q38pack.py model.gguf model-v1.q38pack --format-version 1
 
 ## 2. 编译 Runtime
 
