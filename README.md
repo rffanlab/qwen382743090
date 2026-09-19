@@ -637,3 +637,35 @@ Run:
 The output reports:
 
     kernel_mapping: 4warps_per_cta_1row_per_warp
+
+
+### IQ4_XS occupancy result and PRMT-vectorized native IQ4_XS
+
+Four warps per CTA only moved the real RTX 3090 result from about 199.6 GB/s
+to 202.3 GB/s, so block-count-limited occupancy is not the main bottleneck.
+
+The next native-F32 kernel keeps the 4-warp CTA but changes decode granularity:
+
+    warp = one output row
+    eight 4-lane subgroups = eight IQ4_XS 32-value groups
+
+For every 256-weight block:
+
+    each lane loads 4 packed IQ4 bytes = 8 weights
+    prmt.b32 performs batched nonlinear codebook lookup
+    each lane loads 8 F32 activations and accumulates 8 FMAs
+    4-lane subgroup reduction forms one 32-value group dot
+    only subgroup leader applies d * group_scale
+    final reduction combines eight group leaders
+
+This removes duplicate QS byte loads and moves group scale multiplication
+outside the per-weight hot path.
+
+Run:
+
+    ./build/q38-iq4xs-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+Expected output labels:
+
+    kernel_mapping: 4warps_per_cta_8x4lane_prmt
+    decode: prmt_byte_permute_8weights_per_lane
