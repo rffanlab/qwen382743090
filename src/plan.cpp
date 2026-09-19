@@ -143,13 +143,14 @@ int main(int argc, char** argv) {
         }
 
         if (list) {
-            for (const auto& t : plan.tensors()) {
+            for (std::size_t i = 0; i < plan.tensors().size(); ++i) {
+                const auto& t = plan.tensors()[i];
                 std::cout << t.name
                           << " role=" << role_name(t.role)
                           << " va=0x" << std::hex << t.va_offset << std::dec
                           << " page_off=" << t.page_offset
                           << " bytes=" << t.payload_bytes
-                          << " layout=" << layout_name(source_tensors[&t - plan.tensors().data()].layout)
+                          << " layout=" << layout_name(source_tensors[i].layout)
                           << "\n";
             }
         }
