@@ -96,6 +96,32 @@ int main(int argc, char** argv) {
         const double repack_ms =
             std::chrono::duration<double, std::milli>(repack_t1 - repack_t0).count();
 
+        double repack_decode_max_abs = 0.0;
+        {
+            std::array<float, q38::kQ4KValuesPerBlock> original{};
+            std::array<float, q38::kQ4KValuesPerBlock> transformed{};
+            std::array<std::byte, q38::kQ5KSm86BytesPerBlock> check_block{};
+            const std::size_t checked_blocks = std::min<std::size_t>(total_blocks, 64);
+            for (std::size_t ib = 0; ib < checked_blocks; ++ib) {
+                q38::dequantize_q5_k_block_cpu(
+                    source + ib * q38::kQ5KBytesPerBlock, original);
+                std::memcpy(check_block.data() + 0, repacked.data() + ib * 20, 20);
+                std::memcpy(check_block.data() + 20, repacked.data() + qh_offset + ib * 32, 32);
+                std::memcpy(check_block.data() + 52, repacked.data() + qs_offset + ib * 128, 128);
+                q38::dequantize_q5_k_sm86_block_cpu(check_block.data(), transformed);
+                for (std::size_t j = 0; j < q38::kQ4KValuesPerBlock; ++j) {
+                    repack_decode_max_abs = std::max(
+                        repack_decode_max_abs,
+                        std::abs(static_cast<double>(original[j]) - static_cast<double>(transformed[j])));
+                }
+            }
+            if (repack_decode_max_abs != 0.0) {
+                std::cerr << "q38-q5k-sm86-gemv: repack changed decoded weights, max_abs="
+                          << repack_decode_max_abs << "\n";
+                return 9;
+            }
+        }
+
         std::cout << "Q38RT SM86-repacked Q5_K SoA GEMV\n";
         std::cout << "tensor: " << tensor->name << "\n";
         std::cout << "shape: [" << cols << "," << rows << "]\n";
@@ -107,6 +133,9 @@ int main(int argc, char** argv) {
                       static_cast<double>(original_bytes))
                   << "\n";
         std::cout << "offline_repack_ms: " << repack_ms << "\n";
+        std::cout << std::scientific << std::setprecision(6);
+        std::cout << "repack_decode_max_abs_error: " << repack_decode_max_abs << "\n";
+        std::cout << std::fixed << std::setprecision(3);
         std::cout << "layout: META20_SOA + QH32_SOA + QS128_SOA\n";
 
         q38::NvidiaDriver driver;
