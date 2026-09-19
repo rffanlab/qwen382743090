@@ -8,6 +8,17 @@
 
 namespace q38 {
 
+enum class ProjectionKernelKind {
+    Unsupported = 0,
+    F32Direct,
+    Q4KNative,
+    Q5KSm86Vectorized,
+    IQ4XSPrmt,
+};
+
+const char* projection_kernel_name(ProjectionKernelKind kind) noexcept;
+ProjectionKernelKind select_projection_kernel(const TensorRecord& tensor) noexcept;
+
 struct RuntimeInfo {
     std::string model_path;
     std::uint32_t tensor_count{};
@@ -29,6 +40,10 @@ public:
     [[nodiscard]] RuntimeInfo info() const;
     [[nodiscard]] const PackFile& pack() const noexcept { return pack_; }
     bool gpu_smoke(std::string* error = nullptr) { return driver_.run_sm86_smoke(error); }
+    bool run_layer0_projection_pack(
+        float rms_eps = 1.0e-6f,
+        Layer0ProjectionPackStats* stats = nullptr,
+        std::string* error = nullptr);
 
 private:
     std::filesystem::path model_path_;
