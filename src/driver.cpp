@@ -888,6 +888,168 @@ IQG_DONE:
 }
 )ptx";
 
+constexpr const char* kIQ4XSSm86SoAGemvPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_iq4xs_sm86_soa_gemv(
+    .param .u64 p_d,
+    .param .u64 p_scale,
+    .param .u64 p_qs,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<16>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<28>;
+    .reg .f32 %f<16>;
+
+    ld.param.u64 %rd1, [p_d];
+    ld.param.u64 %rd2, [p_scale];
+    ld.param.u64 %rd3, [p_qs];
+    ld.param.u64 %rd4, [p_x];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    setp.ge.u32 %p1, %r3, %r2;
+    @%p1 bra IQS_DONE;
+    setp.ge.u32 %p2, %r4, 32;
+    @%p2 bra IQS_DONE;
+
+    shr.u32 %r5, %r1, 8;        // blocks_per_row
+    mul.lo.u32 %r6, %r3, %r5;  // first block index for row
+
+    // Packed codebook bytes.
+    mov.u32 %r50, 0xBFAD9881;
+    mov.u32 %r51, 0xF6EADDCF;
+    mov.u32 %r52, 0x26190D01;
+    mov.u32 %r53, 0x71594535;
+
+    mov.u32 %r7, 0;
+    mov.f32 %f10, 0f00000000;
+
+IQS_BLOCK_LOOP:
+    setp.ge.u32 %p3, %r7, %r5;
+    @%p3 bra IQS_BLOCKS_DONE;
+
+    add.u32 %r8, %r6, %r7;      // global block index
+
+    // d plane: fp16 stride 2.
+    shl.b32 %r9, %r8, 1;
+    cvt.u64.u32 %rd6, %r9;
+    add.s64 %rd7, %rd1, %rd6;
+    ld.global.b16 %r40, [%rd7];
+    cvt.f32.f16 %f1, %r40;
+
+    // qs block base: 128-byte stride.
+    shl.b32 %r10, %r8, 7;
+
+    mov.u32 %r11, 0;
+
+IQS_GROUP_LOOP:
+    setp.ge.u32 %p4, %r11, 8;
+    @%p4 bra IQS_GROUPS_DONE;
+
+    // Pre-expanded signed group scale: 8-byte stride per block.
+    shl.b32 %r12, %r8, 3;
+    add.u32 %r12, %r12, %r11;
+    cvt.u64.u32 %rd8, %r12;
+    add.s64 %rd9, %rd2, %rd8;
+    ld.global.s8 %r13, [%rd9];
+
+    cvt.rn.f32.s32 %f2, %r13;
+    mul.rn.f32 %f3, %f1, %f2;
+
+    // Same compact 4-bit weights, now from a 128-byte-aligned SoA plane.
+    and.b32 %r14, %r4, 15;
+    shl.b32 %r15, %r11, 4;
+    add.u32 %r15, %r15, %r14;
+    add.u32 %r15, %r15, %r10;
+    cvt.u64.u32 %rd10, %r15;
+    add.s64 %rd11, %rd3, %rd10;
+    ld.global.u8 %r16, [%rd11];
+
+    setp.lt.u32 %p5, %r4, 16;
+    @%p5 and.b32 %r17, %r16, 15;
+    @!%p5 shr.u32 %r17, %r16, 4;
+
+    // Four-register nonlinear codebook lookup.
+    shr.u32 %r18, %r17, 2;
+    mov.u32 %r19, %r50;
+    setp.eq.u32 %p6, %r18, 1;
+    @%p6 mov.u32 %r19, %r51;
+    setp.eq.u32 %p7, %r18, 2;
+    @%p7 mov.u32 %r19, %r52;
+    setp.eq.u32 %p8, %r18, 3;
+    @%p8 mov.u32 %r19, %r53;
+
+    and.b32 %r20, %r17, 3;
+    shl.b32 %r20, %r20, 3;
+    shr.u32 %r21, %r19, %r20;
+    and.b32 %r21, %r21, 255;
+    shl.b32 %r21, %r21, 24;
+    shr.s32 %r21, %r21, 24;
+
+    cvt.rn.f32.s32 %f4, %r21;
+    mul.rn.f32 %f5, %f3, %f4;
+
+    // x index = block*256 + group*32 + lane
+    shl.b32 %r22, %r7, 8;
+    shl.b32 %r23, %r11, 5;
+    add.u32 %r24, %r22, %r23;
+    add.u32 %r24, %r24, %r4;
+    mul.wide.u32 %rd12, %r24, 4;
+    add.s64 %rd13, %rd4, %rd12;
+    ld.global.f32 %f6, [%rd13];
+
+    fma.rn.f32 %f10, %f5, %f6, %f10;
+
+    add.u32 %r11, %r11, 1;
+    bra IQS_GROUP_LOOP;
+
+IQS_GROUPS_DONE:
+    add.u32 %r7, %r7, 1;
+    bra IQS_BLOCK_LOOP;
+
+IQS_BLOCKS_DONE:
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 16, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 8, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 4, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 2, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+    mov.b32 %r30, %f10;
+    shfl.sync.down.b32 %r31, %r30, 1, 31, 0xffffffff;
+    mov.b32 %f11, %r31;
+    add.rn.f32 %f10, %f10, %f11;
+
+    setp.eq.u32 %p9, %r4, 0;
+    mul.wide.u32 %rd14, %r3, 4;
+    add.s64 %rd15, %rd5, %rd14;
+    @%p9 st.global.f32 [%rd15], %f10;
+
+IQS_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ5KDequantPtx = R"ptx(
 .version 7.1
 .target sm_86
