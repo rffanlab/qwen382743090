@@ -192,3 +192,21 @@ Q5_K real-block correctness 通过后，下一步直接验证 packed weight × a
     effective_weight_bandwidth_GBps
 
 这个 GB/s 是 packed Q5_K 权重流量 / kernel 时间，用来建立 3090 decode 的第一条真实 roofline 基线。
+
+
+### Warp-reduction v2
+
+第一版真实 `blk.0.attn_gate.weight [5120,6144]` 的实测基线为：
+
+    kernel_ms: 0.0963
+    effective_weight_bandwidth_GBps: 224.4699
+
+v2 保持相同数学路径和 benchmark，先做三个低风险优化：
+
+- 每个 Q5_K block 的 qh[32] 每 lane 只读一次；
+- ql byte 同时服务低/高 nibble，相邻两个 group 复用一次 load；
+- 每行 32 次 global atomic 改为 shfl.sync.down warp reduction + lane0 单次 store。
+
+重新运行同一条命令即可直接和 224.4699 GB/s 基线比较：
+
+    ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
