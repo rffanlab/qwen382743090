@@ -1017,6 +1017,168 @@ BG_DONE:
 }
 )ptx";
 
+constexpr const char* kRecurrentTailPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_gated_rmsnorm_silu_128(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_z,
+    .param .u64 p_out,
+    .param .f32 p_eps,
+    .param .f32 p_log2e
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<24>;
+    .shared .align 4 .b8 smem[512];
+
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_z];
+    ld.param.u64 %rd4, [p_out];
+    ld.param.f32 %f1, [p_eps];
+    ld.param.f32 %f2, [p_log2e];
+
+    mov.u32 %r1, %ctaid.x;   // head 0..47
+    mov.u32 %r2, %tid.x;     // element 0..127
+    setp.ge.u32 %p1, %r2, 128;
+    @%p1 bra GRN_DONE;
+
+    shl.b32 %r3, %r1, 7;
+    add.u32 %r4, %r3, %r2;
+    mul.wide.u32 %rd5, %r4, 4;
+    add.s64 %rd6, %rd1, %rd5;
+    add.s64 %rd7, %rd3, %rd5;
+    ld.global.f32 %f3, [%rd6];
+    ld.global.f32 %f4, [%rd7];
+
+    mul.wide.u32 %rd8, %r2, 4;
+    add.s64 %rd9, %rd2, %rd8;
+    ld.global.f32 %f5, [%rd9];
+
+    mul.rn.f32 %f6, %f3, %f3;
+    mov.u64 %rd10, smem;
+    add.s64 %rd11, %rd10, %rd8;
+    st.shared.f32 [%rd11], %f6;
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r2, 64;
+    @%p2 bra GRN_R64_END;
+    ld.shared.f32 %f7, [%rd11];
+    ld.shared.f32 %f8, [%rd11+256];
+    add.rn.f32 %f7, %f7, %f8;
+    st.shared.f32 [%rd11], %f7;
+GRN_R64_END:
+    bar.sync 0;
+
+    setp.ge.u32 %p3, %r2, 32;
+    @%p3 bra GRN_R32_END;
+    ld.shared.f32 %f7, [%rd11];
+    ld.shared.f32 %f8, [%rd11+128];
+    add.rn.f32 %f7, %f7, %f8;
+    st.shared.f32 [%rd11], %f7;
+GRN_R32_END:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r2, 32;
+    @%p4 bra GRN_SCALE;
+    ld.shared.f32 %f9, [%rd11];
+    mov.b32 %r8, %f9;
+    shfl.sync.down.b32 %r9, %r8, 16, 31, 0xffffffff;
+    mov.b32 %f10, %r9;
+    add.rn.f32 %f9, %f9, %f10;
+    mov.b32 %r8, %f9;
+    shfl.sync.down.b32 %r9, %r8, 8, 31, 0xffffffff;
+    mov.b32 %f10, %r9;
+    add.rn.f32 %f9, %f9, %f10;
+    mov.b32 %r8, %f9;
+    shfl.sync.down.b32 %r9, %r8, 4, 31, 0xffffffff;
+    mov.b32 %f10, %r9;
+    add.rn.f32 %f9, %f9, %f10;
+    mov.b32 %r8, %f9;
+    shfl.sync.down.b32 %r9, %r8, 2, 31, 0xffffffff;
+    mov.b32 %f10, %r9;
+    add.rn.f32 %f9, %f9, %f10;
+    mov.b32 %r8, %f9;
+    shfl.sync.down.b32 %r9, %r8, 1, 31, 0xffffffff;
+    mov.b32 %f10, %r9;
+    add.rn.f32 %f9, %f9, %f10;
+
+    setp.ne.u32 %p5, %r2, 0;
+    @%p5 bra GRN_SCALE;
+    cvt.rn.f32.u32 %f11, 128;
+    div.rn.f32 %f12, %f9, %f11;
+    add.rn.f32 %f12, %f12, %f1;
+    rsqrt.approx.f32 %f13, %f12;
+    st.shared.f32 [smem], %f13;
+
+GRN_SCALE:
+    bar.sync 0;
+    ld.shared.f32 %f14, [smem];
+
+    // normalized = input * inv_rms * weight
+    mul.rn.f32 %f15, %f3, %f14;
+    mul.rn.f32 %f15, %f15, %f5;
+
+    // silu(z)
+    neg.f32 %f16, %f4;
+    mul.rn.f32 %f16, %f16, %f2;
+    ex2.approx.f32 %f17, %f16;
+    add.rn.f32 %f17, %f17, 0f3F800000;
+    rcp.approx.f32 %f18, %f17;
+    mul.rn.f32 %f19, %f4, %f18;
+
+    mul.rn.f32 %f20, %f15, %f19;
+    add.s64 %rd12, %rd4, %rd5;
+    st.global.f32 [%rd12], %f20;
+
+GRN_DONE:
+    ret;
+}
+
+.visible .entry q38_add_residual_f32(
+    .param .u64 p_x,
+    .param .u64 p_residual,
+    .param .u64 p_out,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<4>;
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_residual];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.u32 %r1, [p_n];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra AR_DONE;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd6, %rd2, %rd4;
+    add.s64 %rd7, %rd3, %rd4;
+    ld.global.f32 %f1, [%rd5];
+    ld.global.f32 %f2, [%rd6];
+    add.rn.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd7], %f3;
+
+AR_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ4KDequantPtx = R"ptx(
 .version 7.1
 .target sm_86
