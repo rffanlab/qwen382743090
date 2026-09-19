@@ -5257,15 +5257,15 @@ bool NvidiaDriver::run_qwen35_layer0_gate_smoke(
         CUmodule norm_module = load_module(kRmsNormPtx, "cuModuleLoadDataEx(layer0 RMSNorm)");
         CUmodule proj_module{};
         try {
-            proj_module = load_module(kQ5KSm86SoAGemvPtx, "cuModuleLoadDataEx(layer0 gate projection)");
+            proj_module = load_module(kQ5KSm86SoAGemvVecPtx, "cuModuleLoadDataEx(layer0 gate projection)");
 
             CUfunction sum_fn{}, apply_fn{}, proj_fn{};
             check(handle_, module_get_function(&sum_fn, norm_module, "q38_sumsq"),
                   "cuModuleGetFunction(q38_sumsq)");
             check(handle_, module_get_function(&apply_fn, norm_module, "q38_rmsnorm_apply"),
                   "cuModuleGetFunction(q38_rmsnorm_apply)");
-            check(handle_, module_get_function(&proj_fn, proj_module, "q38_q5k_sm86_soa_gemv"),
-                  "cuModuleGetFunction(q38_q5k_sm86_soa_gemv)");
+            check(handle_, module_get_function(&proj_fn, proj_module, "q38_q5k_sm86_soa_gemv_vec"),
+                  "cuModuleGetFunction(q38_q5k_sm86_soa_gemv_vec)");
 
             constexpr unsigned int norm_block = 256;
             const unsigned int norm_grid = (cols + norm_block - 1) / norm_block;
@@ -5303,10 +5303,11 @@ bool NvidiaDriver::run_qwen35_layer0_gate_smoke(
                       "cuLaunchKernel(layer0 rmsnorm apply)");
             };
 
+            const unsigned int proj_grid_rows4 = (rows + 3u) / 4u;
             auto launch_proj = [&]() {
-                check(handle_, launch(proj_fn, rows, 1, 1, 32, 1, 1, 0, nullptr,
+                check(handle_, launch(proj_fn, proj_grid_rows4, 1, 1, 128, 1, 1, 0, nullptr,
                                       proj_params, nullptr),
-                      "cuLaunchKernel(layer0 attn_gate)");
+                      "cuLaunchKernel(layer0 attn_gate vec)");
             };
 
             // End-to-end correctness.
