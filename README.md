@@ -159,3 +159,12 @@ K_P 不是新的 GGML tensor type，而是按 tensor 重要性混用标准量化
     q4_k: PASS
 
 这一步通过后再进入 fused dequant + dot/GEMV，而不是先把整块权重展开成 FP16/FP32。
+
+
+### Q5_K 主权重烟测
+
+当前实测模型的 Q5_K 占 12.048 GiB，是绝对主体。Q4_K 通过后，直接验证真实 Q5_K super-block：
+
+    ./build/q38-q5k-smoke --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+该测试同样从 Q38PACK 里取真实 tensor 的第一个 block，GPU PTX 解量化并和独立 CPU reference 逐元素比较。后续 fused dequant+dot/GEMV 会优先以 Q5_K 为第一优化对象。
