@@ -168,3 +168,27 @@ K_P 不是新的 GGML tensor type，而是按 tensor 重要性混用标准量化
     ./build/q38-q5k-smoke --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
 
 该测试同样从 Q38PACK 里取真实 tensor 的第一个 block，GPU PTX 解量化并和独立 CPU reference 逐元素比较。后续 fused dequant+dot/GEMV 会优先以 Q5_K 为第一优化对象。
+
+
+## Fused Q5_K GEMV baseline
+
+Q5_K real-block correctness 通过后，下一步直接验证 packed weight × activation，不生成中间 FP32/FP16 权重：
+
+    ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+默认目标是：
+
+    blk.0.attn_gate.weight
+    shape [5120,6144]
+    GGML_TYPE_Q5_K
+
+当前 baseline 设计为一个 warp 负责一行，直接从 Q5_K super-block 解码并与 F32 activation 相乘，FP32 累加。为了先锁 correctness，行内归约暂时使用 atomic add；下一版会替换为 warp shuffle / shared reduction。
+
+输出包含：
+
+    max_abs_error
+    max_rel_error
+    kernel_ms
+    effective_weight_bandwidth_GBps
+
+这个 GB/s 是 packed Q5_K 权重流量 / kernel 时间，用来建立 3090 decode 的第一条真实 roofline 基线。
