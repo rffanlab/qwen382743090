@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
         std::cout << "gate_tensor: " << gate->name
                   << " [" << cols << "," << rows << "]\n";
         std::cout << "gate_layout: SM86_Q5K_SOA\n";
+        std::cout << "projection_kernel: q5k_sm86_vec_8weights_per_lane\n";
         std::cout << std::scientific << std::setprecision(6);
         std::cout << "rms_eps: " << rms_eps << "\n";
 
