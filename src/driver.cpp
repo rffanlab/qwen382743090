@@ -5323,6 +5323,420 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
 }
 
 
+
+bool NvidiaDriver::run_gdn_ar_smoke(
+    std::uint32_t state_dim,
+    std::uint32_t qk_heads,
+    std::uint32_t value_heads,
+    GdnArSmokeStats* stats,
+    std::string* error) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error(
+                "q38 GDN AR smoke requires sm_86; detected sm_" +
+                std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (state_dim != 128) {
+            throw std::invalid_argument("current GDN AR PTX is specialized for state_dim=128");
+        }
+        if (qk_heads == 0 || value_heads == 0 || value_heads % qk_heads != 0) {
+            throw std::invalid_argument("GDN AR requires non-zero heads and value_heads divisible by qk_heads");
+        }
+
+        constexpr float kEps = 1.0e-6f;
+        const std::size_t qk_values =
+            static_cast<std::size_t>(qk_heads) * state_dim;
+        const std::size_t v_values =
+            static_cast<std::size_t>(value_heads) * state_dim;
+        const std::size_t state_values =
+            static_cast<std::size_t>(value_heads) *
+            state_dim * state_dim;
+
+        std::vector<float> q(qk_values);
+        std::vector<float> k(qk_values);
+        std::vector<float> v(v_values);
+        std::vector<float> g(value_heads);
+        std::vector<float> beta(value_heads);
+        std::vector<float> state_in(state_values);
+        std::vector<float> out_gpu(v_values);
+        std::vector<float> state_gpu(state_values);
+        std::vector<float> out_ref(v_values);
+        std::vector<float> state_ref(state_values);
+
+        for (std::uint32_t h = 0; h < qk_heads; ++h) {
+            double q_ss = 0.0;
+            double k_ss = 0.0;
+            for (std::uint32_t i = 0; i < state_dim; ++i) {
+                const float fi = static_cast<float>(i);
+                const float fh = static_cast<float>(h);
+                const float qv =
+                    std::sin(fi * 0.037f + fh * 0.11f) * 0.8f +
+                    std::cos(fi * 0.013f - fh * 0.07f) * 0.2f;
+                const float kv =
+                    std::cos(fi * 0.029f + fh * 0.09f) * 0.75f -
+                    std::sin(fi * 0.017f + fh * 0.05f) * 0.25f;
+                q[static_cast<std::size_t>(h) * state_dim + i] = qv;
+                k[static_cast<std::size_t>(h) * state_dim + i] = kv;
+                q_ss += static_cast<double>(qv) * qv;
+                k_ss += static_cast<double>(kv) * kv;
+            }
+            const double q_inv = 1.0 / std::sqrt(q_ss + kEps);
+            const double k_inv = 1.0 / std::sqrt(k_ss + kEps);
+            for (std::uint32_t i = 0; i < state_dim; ++i) {
+                q[static_cast<std::size_t>(h) * state_dim + i] =
+                    static_cast<float>(
+                        static_cast<double>(
+                            q[static_cast<std::size_t>(h) * state_dim + i]) *
+                        q_inv);
+                k[static_cast<std::size_t>(h) * state_dim + i] =
+                    static_cast<float>(
+                        static_cast<double>(
+                            k[static_cast<std::size_t>(h) * state_dim + i]) *
+                        k_inv);
+            }
+        }
+
+        for (std::uint32_t h = 0; h < value_heads; ++h) {
+            g[h] = -0.025f - 0.0015f * static_cast<float>(h % 19);
+            beta[h] = 0.20f + 0.012f * static_cast<float>(h % 37);
+            for (std::uint32_t col = 0; col < state_dim; ++col) {
+                const std::size_t out_idx =
+                    static_cast<std::size_t>(h) * state_dim + col;
+                const float fidx = static_cast<float>(out_idx);
+                v[out_idx] =
+                    std::sin(fidx * 0.009f) * 0.7f +
+                    std::cos(fidx * 0.004f) * 0.3f;
+
+                const std::size_t state_base =
+                    (static_cast<std::size_t>(h) * state_dim + col) *
+                    state_dim;
+                for (std::uint32_t i = 0; i < state_dim; ++i) {
+                    const float fs =
+                        static_cast<float>(state_base + i);
+                    state_in[state_base + i] =
+                        0.012f * std::sin(fs * 0.0013f) +
+                        0.006f * std::cos(fs * 0.0007f);
+                }
+            }
+        }
+
+        const double scale =
+            1.0 / std::sqrt(static_cast<double>(state_dim));
+
+        for (std::uint32_t h = 0; h < value_heads; ++h) {
+            const std::uint32_t qh = h % qk_heads;
+            const float* qh_ptr =
+                q.data() + static_cast<std::size_t>(qh) * state_dim;
+            const float* kh_ptr =
+                k.data() + static_cast<std::size_t>(qh) * state_dim;
+            const double g_val = std::exp(static_cast<double>(g[h]));
+            const double beta_val = static_cast<double>(beta[h]);
+
+            for (std::uint32_t col = 0; col < state_dim; ++col) {
+                const std::size_t state_base =
+                    (static_cast<std::size_t>(h) * state_dim + col) *
+                    state_dim;
+
+                double kv = 0.0;
+                for (std::uint32_t i = 0; i < state_dim; ++i) {
+                    kv +=
+                        static_cast<double>(state_in[state_base + i]) *
+                        static_cast<double>(kh_ptr[i]);
+                }
+
+                const double delta =
+                    (static_cast<double>(
+                        v[static_cast<std::size_t>(h) * state_dim + col]) -
+                     g_val * kv) *
+                    beta_val;
+
+                double attn = 0.0;
+                for (std::uint32_t i = 0; i < state_dim; ++i) {
+                    const double updated =
+                        g_val *
+                            static_cast<double>(state_in[state_base + i]) +
+                        static_cast<double>(kh_ptr[i]) * delta;
+                    state_ref[state_base + i] =
+                        static_cast<float>(updated);
+                    attn +=
+                        updated * static_cast<double>(qh_ptr[i]);
+                }
+
+                out_ref[
+                    static_cast<std::size_t>(h) * state_dim + col] =
+                    static_cast<float>(attn * scale);
+            }
+        }
+
+        const std::size_t q_bytes = q.size() * sizeof(float);
+        const std::size_t k_bytes = k.size() * sizeof(float);
+        const std::size_t v_bytes = v.size() * sizeof(float);
+        const std::size_t g_bytes = g.size() * sizeof(float);
+        const std::size_t beta_bytes = beta.size() * sizeof(float);
+        const std::size_t state_bytes = state_in.size() * sizeof(float);
+        const std::size_t out_bytes = out_gpu.size() * sizeof(float);
+
+        auto align256 = [](std::size_t n) {
+            return (n + 255u) & ~std::size_t(255u);
+        };
+
+        const std::size_t q_off = 0;
+        const std::size_t k_off = align256(q_off + q_bytes);
+        const std::size_t v_off = align256(k_off + k_bytes);
+        const std::size_t g_off = align256(v_off + v_bytes);
+        const std::size_t beta_off = align256(g_off + g_bytes);
+        const std::size_t state_in_off = align256(beta_off + beta_bytes);
+        const std::size_t out_off = align256(state_in_off + state_bytes);
+        const std::size_t state_out_off = align256(out_off + out_bytes);
+        const std::size_t total_bytes = state_out_off + state_bytes;
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD =
+            CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH =
+            CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using ModuleLoadDataEx =
+            CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction =
+            CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel =
+            CUresult(*)(CUfunction,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, unsigned int, unsigned int,
+                        unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod =
+            sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh =
+            sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto module_load_ex =
+            sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload =
+            sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function =
+            sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch =
+            sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync =
+            sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        const CUdeviceptr base = memory.ptr();
+        const CUdeviceptr q_ptr = base + q_off;
+        const CUdeviceptr k_ptr = base + k_off;
+        const CUdeviceptr v_ptr = base + v_off;
+        const CUdeviceptr g_ptr = base + g_off;
+        const CUdeviceptr beta_ptr = base + beta_off;
+        const CUdeviceptr state_in_ptr = base + state_in_off;
+        const CUdeviceptr out_ptr = base + out_off;
+        const CUdeviceptr state_out_ptr = base + state_out_off;
+
+        check(handle_, memcpy_htod(q_ptr, q.data(), q_bytes),
+              "cuMemcpyHtoD(GDN q)");
+        check(handle_, memcpy_htod(k_ptr, k.data(), k_bytes),
+              "cuMemcpyHtoD(GDN k)");
+        check(handle_, memcpy_htod(v_ptr, v.data(), v_bytes),
+              "cuMemcpyHtoD(GDN v)");
+        check(handle_, memcpy_htod(g_ptr, g.data(), g_bytes),
+              "cuMemcpyHtoD(GDN g)");
+        check(handle_, memcpy_htod(beta_ptr, beta.data(), beta_bytes),
+              "cuMemcpyHtoD(GDN beta)");
+        check(handle_, memcpy_htod(
+            state_in_ptr, state_in.data(), state_bytes),
+            "cuMemcpyHtoD(GDN state)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto rc = module_load_ex(
+            &module,
+            kGdnAr128Ptx,
+            static_cast<unsigned int>(
+                sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (rc != CUDA_SUCCESS) {
+            std::string detail =
+                cuda_error(handle_, rc, "cuModuleLoadDataEx(GDN AR)");
+            if (jit_error[0] != '\0') {
+                detail +=
+                    std::string("\nPTX JIT error log:\n") +
+                    jit_error.data();
+            }
+            if (jit_info[0] != '\0') {
+                detail +=
+                    std::string("\nPTX JIT info log:\n") +
+                    jit_info.data();
+            }
+            throw std::runtime_error(detail);
+        }
+
+        try {
+            CUfunction fn{};
+            check(handle_, module_get_function(
+                &fn, module, "q38_gdn_ar_128"),
+                "cuModuleGetFunction(q38_gdn_ar_128)");
+
+            CUdeviceptr arg_q = q_ptr;
+            CUdeviceptr arg_k = k_ptr;
+            CUdeviceptr arg_v = v_ptr;
+            CUdeviceptr arg_g = g_ptr;
+            CUdeviceptr arg_beta = beta_ptr;
+            CUdeviceptr arg_state_in = state_in_ptr;
+            CUdeviceptr arg_out = out_ptr;
+            CUdeviceptr arg_state_out = state_out_ptr;
+            std::uint32_t arg_qk_heads = qk_heads;
+            std::uint32_t arg_value_heads = value_heads;
+            float arg_scale =
+                1.0f / std::sqrt(static_cast<float>(state_dim));
+            float arg_log2e = 1.4426950408889634f;
+
+            void* params[] = {
+                &arg_q,
+                &arg_k,
+                &arg_v,
+                &arg_g,
+                &arg_beta,
+                &arg_state_in,
+                &arg_out,
+                &arg_state_out,
+                &arg_qk_heads,
+                &arg_value_heads,
+                &arg_scale,
+                &arg_log2e,
+            };
+
+            const unsigned int grid_y =
+                (state_dim + 3u) / 4u;
+
+            check(handle_, launch(
+                fn,
+                value_heads, grid_y, 1,
+                128, 1, 1,
+                0, nullptr, params, nullptr),
+                "cuLaunchKernel(q38_gdn_ar_128)");
+            check(handle_, sync(), "cuCtxSynchronize(GDN AR correctness)");
+
+            check(handle_, memcpy_dtoh(
+                out_gpu.data(), out_ptr, out_bytes),
+                "cuMemcpyDtoH(GDN output)");
+            check(handle_, memcpy_dtoh(
+                state_gpu.data(), state_out_ptr, state_bytes),
+                "cuMemcpyDtoH(GDN state)");
+
+            GdnArSmokeStats local{};
+            bool bad = false;
+
+            for (std::size_t i = 0; i < out_gpu.size(); ++i) {
+                const double got =
+                    static_cast<double>(out_gpu[i]);
+                const double ref =
+                    static_cast<double>(out_ref[i]);
+                const double abs_err = std::abs(got - ref);
+                const double rel_err =
+                    abs_err / std::max(1.0e-6, std::abs(ref));
+                local.output_max_abs =
+                    std::max(local.output_max_abs, abs_err);
+                local.output_max_rel =
+                    std::max(local.output_max_rel, rel_err);
+                if (abs_err > 5.0e-4 &&
+                    rel_err > 5.0e-4) {
+                    bad = true;
+                }
+            }
+
+            for (std::size_t i = 0; i < state_gpu.size(); ++i) {
+                const double got =
+                    static_cast<double>(state_gpu[i]);
+                const double ref =
+                    static_cast<double>(state_ref[i]);
+                const double abs_err = std::abs(got - ref);
+                const double rel_err =
+                    abs_err / std::max(1.0e-6, std::abs(ref));
+                local.state_max_abs =
+                    std::max(local.state_max_abs, abs_err);
+                local.state_max_rel =
+                    std::max(local.state_max_rel, rel_err);
+                if (abs_err > 2.0e-4 &&
+                    rel_err > 2.0e-4) {
+                    bad = true;
+                }
+            }
+
+            if (bad) {
+                std::ostringstream oss;
+                oss << "GDN AR mismatch: output_abs="
+                    << local.output_max_abs
+                    << " output_rel=" << local.output_max_rel
+                    << " state_abs=" << local.state_max_abs
+                    << " state_rel=" << local.state_max_rel;
+                throw std::runtime_error(oss.str());
+            }
+
+            constexpr int kIters = 100;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kIters; ++i) {
+                check(handle_, launch(
+                    fn,
+                    value_heads, grid_y, 1,
+                    128, 1, 1,
+                    0, nullptr, params, nullptr),
+                    "cuLaunchKernel(q38_gdn_ar_128 benchmark)");
+            }
+            check(handle_, sync(),
+                  "cuCtxSynchronize(GDN AR benchmark)");
+            const auto t1 = std::chrono::steady_clock::now();
+
+            local.kernel_ms =
+                std::chrono::duration<double, std::milli>(
+                    t1 - t0).count() /
+                static_cast<double>(kIters);
+            local.state_bandwidth_gbps =
+                static_cast<double>(state_bytes * 2) /
+                (local.kernel_ms / 1000.0) / 1.0e9;
+
+            if (stats) *stats = local;
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+
+        check(handle_, module_unload(module),
+              "cuModuleUnload(GDN AR)");
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 bool NvidiaDriver::run_qwen35_layer0_projection_pack(
     const float* norm_weight,
     const std::byte* qkv_matrix,
