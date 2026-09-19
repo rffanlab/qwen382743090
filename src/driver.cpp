@@ -775,6 +775,211 @@ GEMV_DONE:
 }
 )ptx";
 
+constexpr const char* kQ5KQ8KGemvPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_q5k_q8k_gemv(
+    .param .u64 p_weights,
+    .param .u64 p_q8,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<16>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<32>;
+    .reg .f32 %f<20>;
+
+    ld.param.u64 %rd1, [p_weights];
+    ld.param.u64 %rd2, [p_q8];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    mov.u32 %r3, %ctaid.x;      // row
+    mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 5;       // warp/group 0..7
+    and.b32 %r6, %r4, 31;      // lane
+
+    setp.ge.u32 %p1, %r3, %r2;
+    @%p1 bra Q8_GEMV_DONE;
+    setp.ge.u32 %p2, %r5, 8;
+    @%p2 bra Q8_GEMV_DONE;
+
+    shr.u32 %r7, %r1, 8;       // Q5/Q8 blocks per row (cols/256)
+    mul.lo.u32 %r8, %r7, 176;  // Q5 bytes per row
+    mul.wide.u32 %rd4, %r3, %r8;
+    add.s64 %rd5, %rd1, %rd4;  // row weights
+
+    mov.u32 %r9, 0;            // block index
+    mov.f32 %f15, 0f00000000;  // per-warp accumulated contribution (lane0)
+
+Q8_BLOCK_LOOP:
+    setp.ge.u32 %p3, %r9, %r7;
+    @%p3 bra Q8_BLOCKS_DONE;
+
+    // Q5 block pointer.
+    mul.wide.u32 %rd6, %r9, 176;
+    add.s64 %rd7, %rd5, %rd6;
+
+    // Q8 activation block pointer.
+    mul.wide.u32 %rd8, %r9, 292;
+    add.s64 %rd9, %rd2, %rd8;
+
+    // ql byte: ((group/2)*32 + lane), base +48.
+    shr.u32 %r10, %r5, 1;
+    shl.b32 %r10, %r10, 5;
+    add.u32 %r10, %r10, %r6;
+    cvt.u64.u32 %rd10, %r10;
+    add.s64 %rd11, %rd7, 48;
+    add.s64 %rd12, %rd11, %rd10;
+    ld.global.u8 %r11, [%rd12];
+
+    and.b32 %r12, %r5, 1;
+    setp.eq.u32 %p4, %r12, 0;
+    @%p4 bra Q8_LOW_NIBBLE;
+    shr.u32 %r13, %r11, 4;
+    bra Q8_NIBBLE_READY;
+
+Q8_LOW_NIBBLE:
+    and.b32 %r13, %r11, 15;
+
+Q8_NIBBLE_READY:
+    // High fifth bit: qh[lane] bit[group], qh base +16.
+    cvt.u64.u32 %rd13, %r6;
+    add.s64 %rd14, %rd7, 16;
+    add.s64 %rd15, %rd14, %rd13;
+    ld.global.u8 %r14, [%rd15];
+
+    mov.u32 %r15, 1;
+    shl.b32 %r15, %r15, %r5;
+    and.b32 %r16, %r14, %r15;
+    setp.ne.u32 %p5, %r16, 0;
+    mov.u32 %r17, 0;
+    @%p5 mov.u32 %r17, 16;
+    add.u32 %r18, %r13, %r17;  // q5 value 0..31
+
+    // Signed Q8 activation for this group/lane, qs base +4.
+    shl.b32 %r19, %r5, 5;
+    add.u32 %r19, %r19, %r6;
+    cvt.u64.u32 %rd16, %r19;
+    add.s64 %rd17, %rd9, 4;
+    add.s64 %rd18, %rd17, %rd16;
+    ld.global.s8 %r20, [%rd18];
+
+    mul.lo.s32 %r21, %r18, %r20;
+
+    // Integer warp reduction of q5*q8 for this 32-value group.
+    shfl.sync.down.b32 %r22, %r21, 16, 31, 0xffffffff;
+    add.s32 %r21, %r21, %r22;
+    shfl.sync.down.b32 %r22, %r21, 8, 31, 0xffffffff;
+    add.s32 %r21, %r21, %r22;
+    shfl.sync.down.b32 %r22, %r21, 4, 31, 0xffffffff;
+    add.s32 %r21, %r21, %r22;
+    shfl.sync.down.b32 %r22, %r21, 2, 31, 0xffffffff;
+    add.s32 %r21, %r21, %r22;
+    shfl.sync.down.b32 %r22, %r21, 1, 31, 0xffffffff;
+    add.s32 %r21, %r21, %r22;
+
+    // Only lane0 needs the group metadata and correction.
+    setp.ne.u32 %p6, %r6, 0;
+    @%p6 bra Q8_NEXT_BLOCK;
+
+    // Q5 super-block d/dmin.
+    ld.global.b16 %r40, [%rd7+0];
+    ld.global.b16 %r41, [%rd7+2];
+    cvt.f32.f16 %f1, %r40;
+    cvt.f32.f16 %f2, %r41;
+
+    // Decode 6-bit scale/min for group r5.
+    add.s64 %rd19, %rd7, 4;
+    setp.lt.u32 %p7, %r5, 4;
+    @%p7 bra Q8_SCALE_LOW;
+
+    add.u32 %r23, %r5, 4;
+    cvt.u64.u32 %rd20, %r23;
+    add.s64 %rd21, %rd19, %rd20;
+    ld.global.u8 %r24, [%rd21];
+
+    sub.u32 %r25, %r5, 4;
+    cvt.u64.u32 %rd22, %r25;
+    add.s64 %rd23, %rd19, %rd22;
+    ld.global.u8 %r26, [%rd23];
+
+    cvt.u64.u32 %rd24, %r5;
+    add.s64 %rd25, %rd19, %rd24;
+    ld.global.u8 %r27, [%rd25];
+
+    and.b32 %r28, %r24, 15;
+    shr.u32 %r29, %r26, 6;
+    shl.b32 %r29, %r29, 4;
+    or.b32 %r30, %r28, %r29;
+
+    shr.u32 %r31, %r24, 4;
+    shr.u32 %r32, %r27, 6;
+    shl.b32 %r32, %r32, 4;
+    or.b32 %r33, %r31, %r32;
+    bra Q8_SCALE_READY;
+
+Q8_SCALE_LOW:
+    cvt.u64.u32 %rd20, %r5;
+    add.s64 %rd21, %rd19, %rd20;
+    ld.global.u8 %r24, [%rd21];
+    and.b32 %r30, %r24, 63;
+
+    add.u32 %r25, %r5, 4;
+    cvt.u64.u32 %rd22, %r25;
+    add.s64 %rd23, %rd19, %rd22;
+    ld.global.u8 %r26, [%rd23];
+    and.b32 %r33, %r26, 63;
+
+Q8_SCALE_READY:
+    // Q8 block scale.
+    ld.global.f32 %f3, [%rd9+0];
+
+    // Q8 bsums[2*g] + bsums[2*g+1], base +260.
+    shl.b32 %r34, %r5, 2;      // group * 4 bytes
+    cvt.u64.u32 %rd26, %r34;
+    add.s64 %rd27, %rd9, 260;
+    add.s64 %rd28, %rd27, %rd26;
+    ld.global.s16 %r35, [%rd28+0];
+    ld.global.s16 %r36, [%rd28+2];
+    add.s32 %r37, %r35, %r36;
+
+    cvt.rn.f32.s32 %f4, %r21;  // dot(q5,q8)
+    cvt.rn.f32.u32 %f5, %r30;  // Q5 scale
+    cvt.rn.f32.u32 %f6, %r33;  // Q5 min scale
+    cvt.rn.f32.s32 %f7, %r37;  // sum(q8)
+
+    mul.rn.f32 %f8, %f1, %f5;
+    mul.rn.f32 %f9, %f8, %f4;
+    mul.rn.f32 %f10, %f2, %f6;
+    mul.rn.f32 %f11, %f10, %f7;
+    sub.rn.f32 %f12, %f9, %f11;
+    mul.rn.f32 %f13, %f3, %f12;
+    add.rn.f32 %f15, %f15, %f13;
+
+Q8_NEXT_BLOCK:
+    add.u32 %r9, %r9, 1;
+    bra Q8_BLOCK_LOOP;
+
+Q8_BLOCKS_DONE:
+    // Eight warp partials per output row. Baseline uses 8 atomics; once the
+    // integer path is validated we can switch this to one CTA-level reduction.
+    setp.ne.u32 %p8, %r6, 0;
+    @%p8 bra Q8_GEMV_DONE;
+    mul.wide.u32 %rd29, %r3, 4;
+    add.s64 %rd30, %rd3, %rd29;
+    atom.global.add.f32 %f16, [%rd30], %f15;
+
+Q8_GEMV_DONE:
+    ret;
+}
+)ptx";
+
 } // namespace
 
 NvidiaDriver::~NvidiaDriver() { close(); }
