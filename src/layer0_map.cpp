@@ -49,7 +49,7 @@ static const char* support_name(const q38::TensorRecord& t) {
     if (t.ggml_type == 13 && t.layout == q38::TensorLayout::Sm86Q5KSoA) {
         return "Q5K_SM86_READY";
     }
-    if (t.ggml_type == 12) return "NEED_Q4K_GEMV";
+    if (t.ggml_type == 12 && t.layout == q38::TensorLayout::GgufNative) return "Q4K_NATIVE_READY";
     if (t.ggml_type == 14) return "NEED_Q6K_GEMV";
     if (t.ggml_type == 23) return "NEED_IQ4_XS_GEMV";
     if (t.ggml_type == 8) return "NEED_Q8_0_GEMV";
