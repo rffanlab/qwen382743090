@@ -759,3 +759,46 @@ Q5_K shapes:
     ./build/q38-q5k-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor blk.0.ffn_down.weight
 
     ./build/q38-layer0-gate --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+
+## Layer0 projection dispatcher
+
+The retained projection paths are now selected by one Runtime dispatcher instead
+of per-smoke hard-coding:
+
+    F32 + GGUF_NATIVE        -> F32_DIRECT
+    Q4_K + GGUF_NATIVE       -> Q4K_NATIVE
+    Q5_K + SM86_Q5K_SOA     -> Q5K_SM86_VEC
+    IQ4_XS + GGUF_NATIVE     -> IQ4XS_PRMT
+
+Current measured RTX 3090 Q5_K vectorized results across real layer0 shapes:
+
+    blk.0.attn_qkv.weight  [5120,10240]  621.2945 GB/s
+    blk.0.attn_gate.weight [5120, 6144]  564.5549 GB/s
+    blk.0.ffn_up.weight    [5120,17408]  655.6136 GB/s
+    blk.0.ffn_down.weight  [17408,5120]  472.0586 GB/s
+    blk.0.ssm_out.weight   [6144, 5120]  515.8004 GB/s
+
+The real RMSNorm -> attn_gate chain now measures:
+
+    rmsnorm_ms:              0.0143
+    attn_gate_projection_ms: 0.0381
+    chain_ms:                0.0533
+
+The next runtime target shares one normalized hidden vector across all recurrent
+input projections:
+
+    RMSNorm(real blk.0.attn_norm.weight)
+        |
+        +--> attn_qkv  Q5K_SM86_VEC
+        +--> attn_gate Q5K_SM86_VEC
+        +--> ssm_beta  Q4K_NATIVE
+        +--> ssm_alpha Q4K_NATIVE
+
+Run:
+
+    ./build/q38-layer0-projections --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+The benchmark excludes model upload and PTX JIT time, validates each projection
+against the CPU reference, and reports both individual kernel time and the
+combined projection-pack chain time.
