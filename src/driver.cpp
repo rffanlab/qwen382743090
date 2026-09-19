@@ -1283,7 +1283,7 @@ SOA_GROUP_LOOP:
     cvt.u64.u32 %rd10, %r12;
     add.s64 %rd11, %rd7, 4;
     add.s64 %rd12, %rd11, %rd10;
-    ld.global.u16 %r13, [%rd12];
+    ld.global.b16 %r13, [%rd12];
     and.b32 %r14, %r13, 255;
     shr.u32 %r15, %r13, 8;
 
