@@ -323,6 +323,205 @@ APPLY_DONE:
 }
 )ptx";
 
+constexpr const char* kGdnAr128Ptx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+// Qwen3.8/Qwen35 decode-time Gated DeltaNet core.
+// Fixed S_v=128. Grid: x=value head, y=state-column tile (4 columns/CTA).
+// Block: 128 threads = 4 warps, one state column per warp.
+// q/k have Hq heads; value/g/beta/state have Hv heads. value head h reuses
+// q/k head h % Hq, matching llama.cpp fused GDN.
+.visible .entry q38_gdn_ar_128(
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_g,
+    .param .u64 p_beta,
+    .param .u64 p_state_in,
+    .param .u64 p_out,
+    .param .u64 p_state_out,
+    .param .u32 p_qk_heads,
+    .param .u32 p_value_heads,
+    .param .f32 p_scale,
+    .param .f32 p_log2e
+)
+{
+    .reg .pred %p<16>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<32>;
+    .reg .f32 %f<40>;
+
+    ld.param.u64 %rd1, [p_q];
+    ld.param.u64 %rd2, [p_k];
+    ld.param.u64 %rd3, [p_v];
+    ld.param.u64 %rd4, [p_g];
+    ld.param.u64 %rd5, [p_beta];
+    ld.param.u64 %rd6, [p_state_in];
+    ld.param.u64 %rd7, [p_out];
+    ld.param.u64 %rd8, [p_state_out];
+    ld.param.u32 %r1, [p_qk_heads];
+    ld.param.u32 %r2, [p_value_heads];
+    ld.param.f32 %f1, [p_scale];
+    ld.param.f32 %f2, [p_log2e];
+
+    mov.u32 %r3, %ctaid.x;      // value head
+    mov.u32 %r4, %ctaid.y;      // column tile
+    mov.u32 %r5, %tid.x;
+    shr.u32 %r6, %r5, 5;        // warp 0..3
+    and.b32 %r7, %r5, 31;       // lane 0..31
+
+    setp.ge.u32 %p1, %r3, %r2;
+    @%p1 bra GDN_DONE;
+
+    shl.b32 %r8, %r4, 2;
+    add.u32 %r8, %r8, %r6;      // state/output column 0..127
+    setp.ge.u32 %p2, %r8, 128;
+    @%p2 bra GDN_DONE;
+
+    rem.u32 %r9, %r3, %r1;      // q/k head
+
+    // q/k base indices in floats.
+    shl.b32 %r10, %r9, 7;       // qhead * 128
+
+    // State base in floats: head*128*128 + col*128.
+    shl.b32 %r11, %r3, 14;      // head * 16384
+    shl.b32 %r12, %r8, 7;       // col * 128
+    add.u32 %r13, %r11, %r12;
+
+    // Lane owns rows lane + {0,32,64,96}.
+    add.u32 %r14, %r13, %r7;
+    add.u32 %r15, %r10, %r7;
+
+    // Byte addresses state rows.
+    mul.wide.u32 %rd9, %r14, 4;
+    add.s64 %rd10, %rd6, %rd9;
+    add.s64 %rd11, %rd8, %rd9;
+
+    ld.global.f32 %f3,  [%rd10+0];
+    ld.global.f32 %f4,  [%rd10+128];
+    ld.global.f32 %f5,  [%rd10+256];
+    ld.global.f32 %f6,  [%rd10+384];
+
+    // q/k rows.
+    mul.wide.u32 %rd12, %r15, 4;
+    add.s64 %rd13, %rd1, %rd12;
+    add.s64 %rd14, %rd2, %rd12;
+
+    ld.global.f32 %f7,  [%rd13+0];
+    ld.global.f32 %f8,  [%rd13+128];
+    ld.global.f32 %f9,  [%rd13+256];
+    ld.global.f32 %f10, [%rd13+384];
+
+    ld.global.f32 %f11, [%rd14+0];
+    ld.global.f32 %f12, [%rd14+128];
+    ld.global.f32 %f13, [%rd14+256];
+    ld.global.f32 %f14, [%rd14+384];
+
+    // g=head scalar, beta=head scalar, v=head*128+col.
+    mul.wide.u32 %rd15, %r3, 4;
+    add.s64 %rd16, %rd4, %rd15;
+    add.s64 %rd17, %rd5, %rd15;
+    ld.global.f32 %f15, [%rd16];
+    ld.global.f32 %f16, [%rd17];
+
+    shl.b32 %r16, %r3, 7;
+    add.u32 %r16, %r16, %r8;
+    mul.wide.u32 %rd18, %r16, 4;
+    add.s64 %rd19, %rd3, %rd18;
+    ld.global.f32 %f17, [%rd19];
+
+    // g_val = exp(g) using exp2(g * log2(e)).
+    mul.rn.f32 %f18, %f15, %f2;
+    ex2.approx.f32 %f19, %f18;
+
+    // kv partial = dot(state_col, k).
+    mul.rn.f32 %f20, %f3, %f11;
+    fma.rn.f32 %f20, %f4, %f12, %f20;
+    fma.rn.f32 %f20, %f5, %f13, %f20;
+    fma.rn.f32 %f20, %f6, %f14, %f20;
+
+    mov.b32 %r20, %f20;
+    shfl.sync.bfly.b32 %r21, %r20, 16, 31, 0xffffffff;
+    mov.b32 %f21, %r21;
+    add.rn.f32 %f20, %f20, %f21;
+    mov.b32 %r20, %f20;
+    shfl.sync.bfly.b32 %r21, %r20, 8, 31, 0xffffffff;
+    mov.b32 %f21, %r21;
+    add.rn.f32 %f20, %f20, %f21;
+    mov.b32 %r20, %f20;
+    shfl.sync.bfly.b32 %r21, %r20, 4, 31, 0xffffffff;
+    mov.b32 %f21, %r21;
+    add.rn.f32 %f20, %f20, %f21;
+    mov.b32 %r20, %f20;
+    shfl.sync.bfly.b32 %r21, %r20, 2, 31, 0xffffffff;
+    mov.b32 %f21, %r21;
+    add.rn.f32 %f20, %f20, %f21;
+    mov.b32 %r20, %f20;
+    shfl.sync.bfly.b32 %r21, %r20, 1, 31, 0xffffffff;
+    mov.b32 %f21, %r21;
+    add.rn.f32 %f20, %f20, %f21;
+
+    // delta = (v - g*kv) * beta.
+    mul.rn.f32 %f22, %f19, %f20;
+    sub.rn.f32 %f22, %f17, %f22;
+    mul.rn.f32 %f22, %f22, %f16;
+
+    // Update state rows: g*S + k*delta.
+    mul.rn.f32 %f23, %f19, %f3;
+    fma.rn.f32 %f23, %f11, %f22, %f23;
+    mul.rn.f32 %f24, %f19, %f4;
+    fma.rn.f32 %f24, %f12, %f22, %f24;
+    mul.rn.f32 %f25, %f19, %f5;
+    fma.rn.f32 %f25, %f13, %f22, %f25;
+    mul.rn.f32 %f26, %f19, %f6;
+    fma.rn.f32 %f26, %f14, %f22, %f26;
+
+    st.global.f32 [%rd11+0],   %f23;
+    st.global.f32 [%rd11+128], %f24;
+    st.global.f32 [%rd11+256], %f25;
+    st.global.f32 [%rd11+384], %f26;
+
+    // attn partial = dot(updated_state_col, q).
+    mul.rn.f32 %f27, %f23, %f7;
+    fma.rn.f32 %f27, %f24, %f8, %f27;
+    fma.rn.f32 %f27, %f25, %f9, %f27;
+    fma.rn.f32 %f27, %f26, %f10, %f27;
+
+    mov.b32 %r22, %f27;
+    shfl.sync.bfly.b32 %r23, %r22, 16, 31, 0xffffffff;
+    mov.b32 %f28, %r23;
+    add.rn.f32 %f27, %f27, %f28;
+    mov.b32 %r22, %f27;
+    shfl.sync.bfly.b32 %r23, %r22, 8, 31, 0xffffffff;
+    mov.b32 %f28, %r23;
+    add.rn.f32 %f27, %f27, %f28;
+    mov.b32 %r22, %f27;
+    shfl.sync.bfly.b32 %r23, %r22, 4, 31, 0xffffffff;
+    mov.b32 %f28, %r23;
+    add.rn.f32 %f27, %f27, %f28;
+    mov.b32 %r22, %f27;
+    shfl.sync.bfly.b32 %r23, %r22, 2, 31, 0xffffffff;
+    mov.b32 %f28, %r23;
+    add.rn.f32 %f27, %f27, %f28;
+    mov.b32 %r22, %f27;
+    shfl.sync.bfly.b32 %r23, %r22, 1, 31, 0xffffffff;
+    mov.b32 %f28, %r23;
+    add.rn.f32 %f27, %f27, %f28;
+
+    setp.ne.u32 %p3, %r7, 0;
+    @%p3 bra GDN_DONE;
+
+    mul.rn.f32 %f29, %f27, %f1;
+    add.s64 %rd20, %rd7, %rd18;
+    st.global.f32 [%rd20], %f29;
+
+GDN_DONE:
+    ret;
+}
+)ptx";
+
 constexpr const char* kQ4KDequantPtx = R"ptx(
 .version 7.1
 .target sm_86
