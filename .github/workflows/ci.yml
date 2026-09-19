@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Python dependencies
+        run: python3 -m pip install --user numpy
       - name: Python converter tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Build host runtime
