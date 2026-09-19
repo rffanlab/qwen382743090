@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
         std::cout << "kernel_ms: " << ms << "\n";
         std::cout << "effective_weight_bandwidth_GBps: " << gbps << "\n";
         std::cout << "activation_quantization_in_timing: no\n";
-        std::cout << "kernel_mapping: 1warp_4rows_8lane_subgroups\n";
+        std::cout << "kernel_mapping: 1warp_1row_4x8lane_group_subgroups\n";
         std::cout << "dot_instruction: dp4a.u32.s32\n";
         std::cout << "q5_k_x_q8_k: PASS\n";
         return 0;
