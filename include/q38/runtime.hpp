@@ -5,8 +5,19 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace q38 {
+
+enum class Qwen35LayerKind {
+    Missing = 0,
+    Recurrent,
+    FullAttention,
+};
+
+const char* qwen35_layer_kind_name(Qwen35LayerKind kind) noexcept;
+Qwen35LayerKind detect_qwen35_layer_kind(
+    const PackFile& pack, std::uint32_t layer) noexcept;
 
 enum class ProjectionKernelKind {
     Unsupported = 0,
@@ -56,6 +67,12 @@ public:
         std::string* error = nullptr);
 
     bool run_layer0_full(
+        float rms_eps = 1.0e-6f,
+        Layer0FullStats* stats = nullptr,
+        std::string* error = nullptr);
+
+    bool run_recurrent_layer(
+        std::uint32_t layer,
         float rms_eps = 1.0e-6f,
         Layer0FullStats* stats = nullptr,
         std::string* error = nullptr);
