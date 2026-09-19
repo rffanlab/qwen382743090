@@ -6,6 +6,24 @@
 
 namespace q38 {
 
+struct ProjectionErrorStats {
+    double max_abs{};
+    double max_rel{};
+};
+
+struct Layer0ProjectionPackStats {
+    ProjectionErrorStats qkv;
+    ProjectionErrorStats gate;
+    ProjectionErrorStats beta;
+    ProjectionErrorStats alpha;
+    double rmsnorm_ms{};
+    double qkv_ms{};
+    double gate_ms{};
+    double beta_ms{};
+    double alpha_ms{};
+    double chain_ms{};
+};
+
 class NvidiaDriver {
 public:
     NvidiaDriver() = default;
@@ -40,6 +58,24 @@ public:
     bool run_q5k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_q8k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_sm86_gemv_smoke(const std::byte* repacked_matrix, std::size_t qh_offset, std::size_t qs_offset, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* original_equiv_gbps = nullptr, double* physical_gbps = nullptr);
+    bool run_qwen35_layer0_projection_pack(
+        const float* norm_weight,
+        const std::byte* qkv_matrix,
+        std::size_t qkv_qh_offset,
+        std::size_t qkv_qs_offset,
+        std::uint32_t qkv_rows,
+        const std::byte* gate_matrix,
+        std::size_t gate_qh_offset,
+        std::size_t gate_qs_offset,
+        std::uint32_t gate_rows,
+        const std::byte* beta_matrix,
+        const std::byte* alpha_matrix,
+        std::uint32_t cols,
+        std::uint32_t small_rows,
+        float rms_eps,
+        Layer0ProjectionPackStats* stats = nullptr,
+        std::string* error = nullptr);
+
     bool run_qwen35_layer0_gate_smoke(
         const float* norm_weight,
         const std::byte* repacked_matrix,
