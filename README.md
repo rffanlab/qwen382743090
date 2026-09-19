@@ -1140,3 +1140,70 @@ Run any recurrent layer directly:
 The current driver remains dimension-specialized for Qwen3.8-27B, but it is no
 longer layer-index-specialized; the Runtime supplies the selected layer's real
 weights.
+
+
+### Qwen3.8 64-layer topology result
+
+The real model contains exactly:
+
+    48 recurrent layers
+    16 full-attention layers
+    0 missing layers
+
+Full attention occurs at:
+
+    3 7 11 15 19 23 27 31 35 39 43 47 51 55 59 63
+
+All 48 recurrent layers report `runtime=READY`. Independent real-weight runs
+on layers 1, 2, 4 and 62 all pass and cluster around 0.555-0.564 ms per layer.
+
+The 16 full-attention layers have a uniform tensor signature. From the real
+tensor shapes:
+
+    attn_q.weight      [5120,12288] = 24 heads * (Q256 + gate256)
+    attn_k.weight      [5120,1024]  = 4 KV heads * 256
+    attn_v.weight      [5120,1024]  = 4 KV heads * 256
+    attn_output.weight [6144,5120]  = 24 heads * 256 -> hidden
+
+Thus the full-attention head geometry is:
+
+    head_dim = 256
+    q_heads  = 24
+    kv_heads = 4
+
+Q/K/O are already covered by `Q5K_SM86_VEC`. The only missing full-attention
+projection format is native Q6_K for V.
+
+### Native Q6_K vectorized bring-up
+
+Q6_K uses the canonical GGML block:
+
+    ql[128]
+    qh[64]
+    int8 scales[16]
+    fp16 d
+    total 210 bytes / 256 weights
+
+The SM86 kernel maps one row per warp and sixteen 2-lane subgroups per warp.
+Each lane processes eight weights and applies `d * scale` only after subgroup
+reduction.
+
+Run the real full-attention V projection:
+
+    ./build/q38-q6k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor blk.3.attn_v.weight
+
+The same target can later benchmark the Q6_K LM head:
+
+    ./build/q38-q6k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack --tensor output.weight
+
+### Inspect real RoPE / attention metadata
+
+The Q38PACK converter preserves GGUF metadata, but the full-attention runtime
+must use the exact model values rather than architecture defaults.
+
+Run:
+
+    python3 tools/inspect_gguf_meta.py --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf
+
+The inspector retains metadata arrays and prints the real attention and RoPE
+settings needed for the native QG split / RoPE / KV-cache implementation.
