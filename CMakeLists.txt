@@ -33,6 +33,9 @@ target_link_libraries(q38-rmsnorm-smoke PRIVATE q38rt)
 add_executable(q38-q4k-smoke src/q4k_smoke.cpp)
 target_link_libraries(q38-q4k-smoke PRIVATE q38rt)
 
+add_executable(q38-q4k-gemv src/q4k_gemv.cpp)
+target_link_libraries(q38-q4k-gemv PRIVATE q38rt)
+
 add_executable(q38-q5k-smoke src/q5k_smoke.cpp)
 target_link_libraries(q38-q5k-smoke PRIVATE q38rt)
 
