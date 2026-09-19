@@ -47,7 +47,7 @@ static const char* support_name(const q38::TensorRecord& t) {
         return "F32_DIRECT";
     }
     if (t.ggml_type == 13 && t.layout == q38::TensorLayout::Sm86Q5KSoA) {
-        return "Q5K_SM86_READY";
+        return "Q5K_SM86_VEC_READY";
     }
     if (t.ggml_type == 12 && t.layout == q38::TensorLayout::GgufNative) return "Q4K_NATIVE_READY";
     if (t.ggml_type == 14) return "NEED_Q6K_GEMV";
