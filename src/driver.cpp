@@ -5391,41 +5391,8 @@ bool NvidiaDriver::run_qwen35_layer0_projection_pack(
                 &norm_sumsq, &count, &kernel_eps
             };
 
-            auto make_q5_args = [&](CUdeviceptr tensor_ptr,
-                                     std::size_t qh_offset,
-                                     std::size_t qs_offset,
-                                     CUdeviceptr out_ptr,
-                                     std::uint32_t rows) {
-                struct Args {
-                    CUdeviceptr meta;
-                    CUdeviceptr qh;
-                    CUdeviceptr qs;
-                    CUdeviceptr x;
-                    CUdeviceptr y;
-                    std::uint32_t cols;
-                    std::uint32_t rows;
-                    void* params[7];
-                };
-                Args a{};
-                a.meta = tensor_ptr;
-                a.qh = tensor_ptr + qh_offset;
-                a.qs = tensor_ptr + qs_offset;
-                a.x = normed_ptr;
-                a.y = out_ptr;
-                a.cols = cols;
-                a.rows = rows;
-                a.params[0] = &a.meta;
-                a.params[1] = &a.qh;
-                a.params[2] = &a.qs;
-                a.params[3] = &a.x;
-                a.params[4] = &a.y;
-                a.params[5] = &a.cols;
-                a.params[6] = &a.rows;
-                return a;
-            };
-
-            // Do not use make_q5_args() across statements: params contain
-            // pointers to the object's own members, so instantiate in-place.
+            // Keep kernel arguments as stable local variables because the
+            // Driver API launch parameter array stores pointers to them.
             CUdeviceptr qkv_meta = qkv_ptr;
             CUdeviceptr qkv_qh = qkv_ptr + qkv_qh_offset;
             CUdeviceptr qkv_qs = qkv_ptr + qkv_qs_offset;
