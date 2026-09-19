@@ -5276,7 +5276,7 @@ bool NvidiaDriver::run_q6k_gemv_smoke(
         CUmodule module{};
         const auto rc = module_load_ex(
             &module,
-            kQ6KGemvPtx,
+            kQ6KGemvScalarPtx,
             static_cast<unsigned int>(
                 sizeof(jit_options) / sizeof(jit_options[0])),
             jit_options,
@@ -5302,8 +5302,8 @@ bool NvidiaDriver::run_q6k_gemv_smoke(
         try {
             CUfunction fn{};
             check(handle_, module_get_function(
-                &fn, module, "q38_q6k_gemv_f32"),
-                "cuModuleGetFunction(q38_q6k_gemv_f32)");
+                &fn, module, "q38_q6k_gemv_f32_scalar"),
+                "cuModuleGetFunction(q38_q6k_gemv_f32_scalar)");
 
             CUdeviceptr arg_w = matrix_ptr;
             CUdeviceptr arg_x = x_ptr;
@@ -5315,14 +5315,12 @@ bool NvidiaDriver::run_q6k_gemv_smoke(
                 &arg_cols, &arg_rows
             };
 
-            const unsigned int grid_rows4 =
-                (rows + 3u) / 4u;
             check(handle_, launch(
                 fn,
-                grid_rows4, 1, 1,
-                128, 1, 1,
+                rows, 1, 1,
+                32, 1, 1,
                 0, nullptr, params, nullptr),
-                "cuLaunchKernel(q38_q6k_gemv_f32)");
+                "cuLaunchKernel(q38_q6k_gemv_f32_scalar)");
             check(handle_, sync(),
                   "cuCtxSynchronize(Q6_K correctness)");
             check(handle_, memcpy_dtoh(
@@ -5394,10 +5392,10 @@ bool NvidiaDriver::run_q6k_gemv_smoke(
             for (int i = 0; i < iters; ++i) {
                 check(handle_, launch(
                     fn,
-                    grid_rows4, 1, 1,
-                    128, 1, 1,
+                    rows, 1, 1,
+                    32, 1, 1,
                     0, nullptr, params, nullptr),
-                    "cuLaunchKernel(q38_q6k_gemv_f32 benchmark)");
+                    "cuLaunchKernel(q38_q6k_gemv_f32_scalar benchmark)");
             }
             check(handle_, sync(),
                   "cuCtxSynchronize(Q6_K benchmark)");
