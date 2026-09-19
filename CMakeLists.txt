@@ -57,6 +57,9 @@ target_link_libraries(q38-iq4xs-gemv PRIVATE q38rt)
 add_executable(q38-iq4xs-sm86-gemv src/iq4xs_sm86_gemv.cpp)
 target_link_libraries(q38-iq4xs-sm86-gemv PRIVATE q38rt)
 
+add_executable(q38-iq4xs-q81-gemv src/iq4xs_q81_gemv.cpp)
+target_link_libraries(q38-iq4xs-q81-gemv PRIVATE q38rt)
+
 add_executable(q38-layer0-gate src/layer0_gate.cpp)
 target_link_libraries(q38-layer0-gate PRIVATE q38rt)
 
