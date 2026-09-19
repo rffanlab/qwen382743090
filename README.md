@@ -401,3 +401,45 @@ CPU reference 使用相同真实 norm/Q5_K 权重验证前 8 个输出行。输�
     chain_equiv_calls_per_second
 
 这个 target 的意义是从“单算子 benchmark”跨到真实 Qwen3.8 layer execution。下一阶段会把 blk.0 的 qkv、beta、alpha、DeltaNet state 与 FFN 继续接入同一个 Layer Executor。
+
+
+### layer0 tensor map
+
+真实 RTX 3090 的第一条 Qwen3.8 layer0 链已经通过：
+
+    RMSNorm(real blk.0.attn_norm.weight)
+      0.0142 ms
+        ↓
+    SM86 Q5_K GEMV(real blk.0.attn_gate.weight)
+      0.0651 ms / 332.3960 GB/s
+        ↓
+    chain
+      0.0794 ms
+
+correctness:
+
+    max_abs_error: 1.942233e-06
+    max_rel_error: 1.060515e-05
+
+继续扩展完整 recurrent layer 之前，先用真实 Q38PACK v2 列出 blk.0 的 tensor type/layout：
+
+    ./build/q38-layer0-map --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+它会检查：
+
+    blk.0.attn_norm.weight
+    blk.0.attn_qkv.weight
+    blk.0.attn_gate.weight
+    blk.0.ssm_conv1d.weight
+    blk.0.ssm_dt.bias
+    blk.0.ssm_a
+    blk.0.ssm_beta.weight
+    blk.0.ssm_alpha.weight
+    blk.0.ssm_norm.weight
+    blk.0.ssm_out.weight
+    blk.0.attn_post_norm.weight
+    blk.0.ffn_gate.weight
+    blk.0.ffn_up.weight
+    blk.0.ffn_down.weight
+
+并给每个 tensor 标记当前 runtime 支持状态（例如 Q5K_SM86_READY / NEED_Q6K_GEMV / NEED_IQ4_XS_GEMV / NEED_Q8_0_GEMV）。这个映射决定下一阶段 Qwen35LayerExecutor 的 kernel 优先级。
