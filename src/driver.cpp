@@ -2693,7 +2693,8 @@ Q5V_BLOCK_LOOP:
     mul.rn.f32 %f28, %f24, %f26;
     mul.rn.f32 %f29, %f25, %f27;
     mul.rn.f32 %f31, %f28, %f20;
-    fma.rn.f32 %f31, -%f29, %f21, %f31;
+    neg.f32 %f33, %f29;
+    fma.rn.f32 %f31, %f33, %f21, %f31;
     add.rn.f32 %f30, %f30, %f31;
 
 Q5V_NEXT_BLOCK:
