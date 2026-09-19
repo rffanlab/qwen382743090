@@ -622,6 +622,13 @@ BLOCK_LOOP:
     cvt.f32.f16 %f1, %r40;
     cvt.f32.f16 %f2, %r41;
 
+    // qh has one byte per lane and its 8 bits serve all 8 groups.
+    // Cache it once per Q5_K super-block instead of reloading it per group.
+    cvt.u64.u32 %rd18, %r4;
+    add.s64 %rd19, %rd7, 16;
+    add.s64 %rd20, %rd19, %rd18;
+    ld.global.u8 %r39, [%rd20];
+
     mov.u32 %r8, 0; // group 0..7
 
 GROUP_LOOP:
@@ -677,16 +684,18 @@ GEMV_SCALE_READY:
     mul.rn.f32 %f6, %f2, %f4;
 
     // ql byte index = (group/2)*32 + lane, ql base = +48.
+    // One ql byte serves two adjacent groups (low and high nibble), so only
+    // fetch it for even groups and retain r21 for the odd group.
     shr.u32 %r20, %r8, 1;
     shl.b32 %r20, %r20, 5;
     add.u32 %r20, %r20, %r4;
     cvt.u64.u32 %rd15, %r20;
     add.s64 %rd16, %rd7, 48;
     add.s64 %rd17, %rd16, %rd15;
-    ld.global.u8 %r21, [%rd17];
 
     and.b32 %r22, %r8, 1;
     setp.eq.u32 %p6, %r22, 0;
+    @%p6 ld.global.u8 %r21, [%rd17];
     @%p6 bra GEMV_LOW_NIBBLE;
     shr.u32 %r23, %r21, 4;
     bra GEMV_NIBBLE_READY;
@@ -695,14 +704,10 @@ GEMV_LOW_NIBBLE:
     and.b32 %r23, %r21, 15;
 
 GEMV_NIBBLE_READY:
-    // High bit: qh[lane] bit[group], qh base = +16.
-    cvt.u64.u32 %rd18, %r4;
-    add.s64 %rd19, %rd7, 16;
-    add.s64 %rd20, %rd19, %rd18;
-    ld.global.u8 %r24, [%rd20];
+    // High bit: cached qh[lane] bit[group].
     mov.u32 %r25, 1;
     shl.b32 %r25, %r25, %r8;
-    and.b32 %r26, %r24, %r25;
+    and.b32 %r26, %r39, %r25;
     setp.ne.u32 %p7, %r26, 0;
     mov.u32 %r27, 0;
     @%p7 mov.u32 %r27, 16;
@@ -731,11 +736,37 @@ GROUPS_DONE:
     bra BLOCK_LOOP;
 
 BLOCKS_DONE:
-    // Baseline reduction: 32 atomics to one output element per row.
-    // This is intentionally simple; warp-shuffle reduction is the next perf step.
+    // Warp reduction. Shuffle moves raw 32-bit float payloads; only lane 0
+    // writes the final row result. This replaces 32 contended global atomics.
+    mov.b32 %r42, %f10;
+    shfl.sync.down.b32 %r43, %r42, 16, 31, 0xffffffff;
+    mov.b32 %f12, %r43;
+    add.rn.f32 %f10, %f10, %f12;
+
+    mov.b32 %r42, %f10;
+    shfl.sync.down.b32 %r43, %r42, 8, 31, 0xffffffff;
+    mov.b32 %f12, %r43;
+    add.rn.f32 %f10, %f10, %f12;
+
+    mov.b32 %r42, %f10;
+    shfl.sync.down.b32 %r43, %r42, 4, 31, 0xffffffff;
+    mov.b32 %f12, %r43;
+    add.rn.f32 %f10, %f10, %f12;
+
+    mov.b32 %r42, %f10;
+    shfl.sync.down.b32 %r43, %r42, 2, 31, 0xffffffff;
+    mov.b32 %f12, %r43;
+    add.rn.f32 %f10, %f10, %f12;
+
+    mov.b32 %r42, %f10;
+    shfl.sync.down.b32 %r43, %r42, 1, 31, 0xffffffff;
+    mov.b32 %f12, %r43;
+    add.rn.f32 %f10, %f10, %f12;
+
+    setp.eq.u32 %p8, %r4, 0;
     mul.wide.u32 %rd23, %r3, 4;
     add.s64 %rd23, %rd3, %rd23;
-    atom.global.add.f32 %f12, [%rd23], %f10;
+    @%p8 st.global.f32 [%rd23], %f10;
 
 GEMV_DONE:
     ret;
