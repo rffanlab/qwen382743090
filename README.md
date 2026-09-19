@@ -132,3 +132,30 @@ M1 的 Driver context、VMM allocation 和 PTX module/launch smoke 已经落地�
 需要逐 tensor 查看 VA offset：
 
     ./build/q38-plan --model /models/Qwen3.8-27B.q38pack --page-bytes 2097152 --list
+
+
+## K_P 量化实际类型分布
+
+K_P 不是新的 GGML tensor type，而是按 tensor 重要性混用标准量化类型。更新代码后重新构建，再运行：
+
+    ./build/q38-plan --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack --page-bytes 2097152
+
+输出底部会额外显示类似：
+
+    type[12/Q4_K]: ...
+    type[13/Q5_K]: ...
+    type[14/Q6_K]: ...
+
+这决定 Native Runtime 需要优先实现哪些标准 quant kernel。
+
+## 真实模型 Q4_K 解量化烟测
+
+该测试不会使用 synthetic 权重。它会从 Q38PACK 中找到第一个 `GGML_TYPE_Q4_K (12)` tensor，取第一个真实 144-byte / 256-weight super-block，在 RTX 3090 上用我们的 PTX 解量化，并和独立 CPU reference 逐元素比较：
+
+    ./build/q38-q4k-smoke --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+成功时应看到：
+
+    q4_k: PASS
+
+这一步通过后再进入 fused dequant + dot/GEMV，而不是先把整块权重展开成 FP16/FP32。
