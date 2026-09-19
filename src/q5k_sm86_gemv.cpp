@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
             return 10;
         }
 
-        std::cout << "Q38RT SM86-repacked Q5_K SoA GEMV\n";
+        std::cout << "Q38RT SM86 Q5_K SoA GEMV vectorized\n";
         std::cout << "q38pack_version: " << pack.header().version << "\n";
         std::cout << "source_layout: " << (persisted_v2 ? "persisted_v2" : "temporary_from_native") << "\n";
         std::cout << "tensor: " << tensor->name << "\n";
