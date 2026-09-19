@@ -855,3 +855,41 @@ The smoke validates all 6144 output values and the complete 48*128*128 updated
 state against an independent CPU implementation, then reports kernel latency and
 state read+write bandwidth. This target is decode-only (n_tokens=1); prefill
 chunking is intentionally deferred.
+
+
+### Real recurrent prep bring-up
+
+The fused Gated DeltaNet autoregressive core is validated on RTX 3090:
+
+    state_dim: 128
+    qk_heads: 16
+    value_heads: 48
+    kernel_ms: 0.0061
+    state_read_write_bandwidth_GBps: 1024.7322
+
+Full output and full 48*128*128 state comparisons pass against the CPU oracle.
+
+The next decode-stage bring-up uses the real layer0 F32 tensors:
+
+    blk.0.ssm_conv1d.weight [4,10240]
+    blk.0.ssm_dt.bias       [48]
+    blk.0.ssm_a             [48]
+
+and validates the exact Qwen35 preprocessing sequence:
+
+    previous conv state[3,10240] + current qkv[10240]
+        -> depthwise Conv1D(kernel=4)
+        -> SiLU
+        -> q[2048] / k[2048] / v[6144] split
+        -> per-head q/k L2 normalization
+        -> beta = sigmoid(beta_raw)
+        -> gate = softplus(alpha_raw + dt_bias) * ssm_a
+
+Run:
+
+    ./build/q38-recurrent-prep --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+This target uses deterministic synthetic projection outputs and conv state, but
+real model conv/dt/a tensors. It validates the complete conv output, normalized
+Q/K, beta/gate values and rolled conv state against independent CPU math before
+the stage is embedded into the shared layer0 Runtime workspace.
