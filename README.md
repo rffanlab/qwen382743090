@@ -210,3 +210,22 @@ v2 保持相同数学路径和 benchmark，先做三个低风险优化：
 重新运行同一条命令即可直接和 224.4699 GB/s 基线比较：
 
     ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
+
+
+### Lane-0 metadata broadcast v3
+
+第二版实测：
+
+    kernel_ms: 0.0863
+    effective_weight_bandwidth_GBps: 250.7441
+
+v3 在保持相同 packed Q5_K × F32 数学路径的前提下进一步减少 warp 内重复工作：
+
+- d/dmin 只由 lane 0 从 global memory 读取，再用 shfl.sync.idx 广播；
+- 每个 32-value group 的 6-bit scale/min 只由 lane 0 解码；
+- scale/min 解码结果通过 warp shuffle 广播给其余 31 个 lane；
+- qh/ql 缓存和 warp reduction 保持 v2 方案。
+
+重新执行相同 GEMV benchmark，可直接和 250.7441 GB/s 对比：
+
+    ./build/q38-q5k-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.q38pack
