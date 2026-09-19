@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
             "blk.0.ssm_alpha.weight",
             "blk.0.ssm_norm.weight",
             "blk.0.ssm_out.weight",
-            "blk.0.attn_post_norm.weight",
+            "blk.0.post_attention_norm.weight",
             "blk.0.ffn_gate.weight",
             "blk.0.ffn_up.weight",
             "blk.0.ffn_down.weight",
