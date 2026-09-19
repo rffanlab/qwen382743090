@@ -333,7 +333,7 @@ constexpr const char* kQ4KDequantPtx = R"ptx(
 )
 {
     .reg .pred %p<8>;
-    .reg .b16 %h<4>;
+    .reg .f16 %h<4>;
     .reg .b32 %r<24>;
     .reg .b64 %rd<16>;
     .reg .f32 %f<12>;
@@ -346,8 +346,8 @@ constexpr const char* kQ4KDequantPtx = R"ptx(
     @%p1 bra Q4K_DONE;
 
     // d and dmin
-    ld.global.b16 %h1, [%rd1+0];
-    ld.global.b16 %h2, [%rd1+2];
+    ld.global.f16 %h1, [%rd1+0];
+    ld.global.f16 %h2, [%rd1+2];
     cvt.f32.f16 %f1, %h1;
     cvt.f32.f16 %f2, %h2;
 
