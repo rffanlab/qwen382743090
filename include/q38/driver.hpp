@@ -20,6 +20,19 @@ struct GdnArSmokeStats {
     double state_bandwidth_gbps{};
 };
 
+struct Layer0RecurrentFrontStats {
+    double conv_max_abs{};
+    double q_max_abs{};
+    double k_max_abs{};
+    double beta_max_abs{};
+    double gate_max_abs{};
+    double gdn_output_max_abs{};
+    double gdn_state_max_abs{};
+    double conv_prep_ms{};
+    double gdn_ms{};
+    double chain_ms{};
+};
+
 struct Layer0ProjectionPackStats {
     ProjectionErrorStats qkv;
     ProjectionErrorStats gate;
@@ -67,6 +80,23 @@ public:
     bool run_q5k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_q8k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
     bool run_q5k_sm86_gemv_smoke(const std::byte* repacked_matrix, std::size_t qh_offset, std::size_t qs_offset, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* original_equiv_gbps = nullptr, double* physical_gbps = nullptr);
+    bool run_qwen35_layer0_recurrent_front(
+        const float* norm_weight,
+        const std::byte* qkv_matrix,
+        std::size_t qkv_qh_offset,
+        std::size_t qkv_qs_offset,
+        const std::byte* z_matrix,
+        std::size_t z_qh_offset,
+        std::size_t z_qs_offset,
+        const std::byte* beta_matrix,
+        const std::byte* alpha_matrix,
+        const float* conv_weight,
+        const float* dt_bias,
+        const float* ssm_a,
+        float rms_eps,
+        Layer0RecurrentFrontStats* stats = nullptr,
+        std::string* error = nullptr);
+
     bool run_gdn_ar_smoke(
         std::uint32_t state_dim = 128,
         std::uint32_t qk_heads = 16,
