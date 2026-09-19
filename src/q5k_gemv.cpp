@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
         const auto cols = static_cast<std::uint32_t>(tensor->dims[0]);
         const auto rows = static_cast<std::uint32_t>(tensor->dims[1]);
 
-        std::cout << "Q38RT fused Q5_K GEMV baseline\n";
+        std::cout << "Q38RT fused Q5_K GEMV\n";
         std::cout << "tensor: " << tensor->name << "\n";
         std::cout << "shape: [" << cols << "," << rows << "]\n";
         std::cout << "stored bytes: " << tensor->stored_bytes << "\n";
