@@ -28,6 +28,7 @@ struct Layer0RecurrentFrontStats {
     double gate_max_abs{};
     double gdn_output_max_abs{};
     double gdn_state_max_abs{};
+    double projection_ms{};
     double conv_prep_ms{};
     double gdn_ms{};
     double chain_ms{};
