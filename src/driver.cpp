@@ -5044,6 +5044,9 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
             std::array<std::byte, kQ5KSm86BytesPerBlock> block{};
             double abs_max = 0.0;
             double rel_max = 0.0;
+            bool tolerance_violation = false;
+            constexpr double kAbsTol = 2.0e-3;
+            constexpr double kRelTol = 2.0e-3;
 
             for (std::size_t row = 0; row < checked_rows; ++row) {
                 double ref = 0.0;
@@ -5070,11 +5073,18 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
                 const double rel_err = abs_err / std::max(1.0e-5, std::abs(ref));
                 abs_max = std::max(abs_max, abs_err);
                 rel_max = std::max(rel_max, rel_err);
+
+                // Relative error is ill-conditioned when the reference dot is
+                // close to zero. Treat a row as wrong only when both its
+                // absolute and relative errors exceed tolerance.
+                if (abs_err > kAbsTol && rel_err > kRelTol) {
+                    tolerance_violation = true;
+                }
             }
 
             if (max_abs_error) *max_abs_error = abs_max;
             if (max_rel_error) *max_rel_error = rel_max;
-            if (!(abs_max <= 2.0e-3 && rel_max <= 2.0e-3)) {
+            if (tolerance_violation) {
                 std::ostringstream oss;
                 oss << "SM86 Q5_K GEMV mismatch: max_abs=" << abs_max
                     << " max_rel=" << rel_max;
