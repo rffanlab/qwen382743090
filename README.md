@@ -469,3 +469,21 @@ Before building GEMV, validate a real 136-byte / 256-weight IQ4_XS block against
     ./build/q38-iq4xs-smoke --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
 
 IQ4_XS uses the standard non-linear 16-value codebook and per-32-value signed scale. Once this smoke passes, the next step is the fused IQ4_XS GEMV / possible SM86 repack benchmark.
+
+
+### IQ4_XS GEMV baseline
+
+Real-block IQ4_XS dequantization passed with zero GPU/CPU error on:
+
+    blk.0.ffn_gate.weight  [5120,17408]
+
+The next benchmark keeps the original GGUF IQ4_XS layout and performs fused dequant + F32 GEMV:
+
+    ./build/q38-iq4xs-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+The kernel uses one warp per output row. Each 136-byte / 256-weight block contains eight 32-value groups. IQ4_XS nibbles are decoded through the standard nonlinear 16-value codebook; the PTX baseline implements the codebook as four packed 32-bit registers instead of a 16-way branch chain.
+
+Decision rule:
+
+    close to or above ~250 GB/s -> keep native IQ4_XS layout
+    clearly below ~250 GB/s    -> prototype SM86_IQ4_XS_SOA and persist it in Q38PACK v2 only if benchmarked beneficial
