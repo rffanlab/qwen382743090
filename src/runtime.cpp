@@ -133,6 +133,105 @@ bool Runtime::run_layer0_projection_pack(
     }
 }
 
+
+bool Runtime::run_layer0_recurrent_front(
+    float rms_eps,
+    Layer0RecurrentFrontStats* stats,
+    std::string* error) {
+    try {
+        if (!driver_.available()) {
+            throw std::runtime_error(
+                "layer0 recurrent front requires an initialized GPU driver");
+        }
+
+        auto require = [&](const char* name) -> const TensorRecord& {
+            const auto* tensor = pack_.find_tensor(name);
+            if (!tensor) {
+                throw std::runtime_error(
+                    std::string("missing tensor: ") + name);
+            }
+            return *tensor;
+        };
+
+        const auto& norm  = require("blk.0.attn_norm.weight");
+        const auto& qkv   = require("blk.0.attn_qkv.weight");
+        const auto& z     = require("blk.0.attn_gate.weight");
+        const auto& beta  = require("blk.0.ssm_beta.weight");
+        const auto& alpha = require("blk.0.ssm_alpha.weight");
+        const auto& conv  = require("blk.0.ssm_conv1d.weight");
+        const auto& dt    = require("blk.0.ssm_dt.bias");
+        const auto& a     = require("blk.0.ssm_a");
+
+        if (select_projection_kernel(norm) !=
+                ProjectionKernelKind::F32Direct ||
+            select_projection_kernel(qkv) !=
+                ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(z) !=
+                ProjectionKernelKind::Q5KSm86Vectorized ||
+            select_projection_kernel(beta) !=
+                ProjectionKernelKind::Q4KNative ||
+            select_projection_kernel(alpha) !=
+                ProjectionKernelKind::Q4KNative) {
+            throw std::runtime_error(
+                "layer0 recurrent-front projection kernel dispatch mismatch");
+        }
+
+        if (conv.ggml_type != 0 ||
+            dt.ggml_type != 0 ||
+            a.ggml_type != 0 ||
+            conv.layout != TensorLayout::GgufNative ||
+            dt.layout != TensorLayout::GgufNative ||
+            a.layout != TensorLayout::GgufNative) {
+            throw std::runtime_error(
+                "layer0 recurrent-front conv/dt/a must be F32 GGUF_NATIVE");
+        }
+
+        if (norm.ndim != 1 || norm.dims[0] != 5120 ||
+            qkv.ndim < 2 || qkv.dims[0] != 5120 || qkv.dims[1] != 10240 ||
+            z.ndim < 2 || z.dims[0] != 5120 || z.dims[1] != 6144 ||
+            beta.ndim < 2 || beta.dims[0] != 5120 || beta.dims[1] != 48 ||
+            alpha.ndim < 2 || alpha.dims[0] != 5120 || alpha.dims[1] != 48 ||
+            conv.ndim < 2 || conv.dims[0] != 4 || conv.dims[1] != 10240 ||
+            dt.dims[0] != 48 || a.dims[0] != 48) {
+            throw std::runtime_error(
+                "layer0 recurrent-front tensor shapes do not match Qwen3.8-27B");
+        }
+
+        const auto qkv_qh_offset =
+            static_cast<std::size_t>(
+                qkv.aux0_offset - qkv.data_offset);
+        const auto qkv_qs_offset =
+            static_cast<std::size_t>(
+                qkv.aux1_offset - qkv.data_offset);
+        const auto z_qh_offset =
+            static_cast<std::size_t>(
+                z.aux0_offset - z.data_offset);
+        const auto z_qs_offset =
+            static_cast<std::size_t>(
+                z.aux1_offset - z.data_offset);
+
+        return driver_.run_qwen35_layer0_recurrent_front(
+            reinterpret_cast<const float*>(pack_.tensor_data(norm)),
+            pack_.tensor_data(qkv),
+            qkv_qh_offset,
+            qkv_qs_offset,
+            pack_.tensor_data(z),
+            z_qh_offset,
+            z_qs_offset,
+            pack_.tensor_data(beta),
+            pack_.tensor_data(alpha),
+            reinterpret_cast<const float*>(pack_.tensor_data(conv)),
+            reinterpret_cast<const float*>(pack_.tensor_data(dt)),
+            reinterpret_cast<const float*>(pack_.tensor_data(a)),
+            rms_eps,
+            stats,
+            error);
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 RuntimeInfo Runtime::info() const {
     RuntimeInfo out;
     out.model_path = model_path_.string();
