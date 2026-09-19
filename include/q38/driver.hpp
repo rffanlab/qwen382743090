@@ -37,9 +37,11 @@ struct Layer0RecurrentAttentionStats {
     double gated_norm_max_abs{};
     double ssm_out_max_abs{};
     double residual_max_abs{};
+    double front_ms{};
     double gated_norm_ms{};
     double ssm_out_ms{};
     double tail_ms{};
+    double sum_stage_ms{};
     double chain_ms{};
 };
 
