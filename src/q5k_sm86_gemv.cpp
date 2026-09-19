@@ -68,38 +68,52 @@ int main(int argc, char** argv) {
         const std::size_t total_blocks = static_cast<std::size_t>(rows) * blocks_per_row;
         const std::size_t original_bytes = total_blocks * q38::kQ5KBytesPerBlock;
 
-        if (tensor->stored_bytes < original_bytes) {
-            std::cerr << "q38-q5k-sm86-gemv: tensor storage is smaller than expected Q5_K payload\n";
-            return 7;
-        }
-
-        // Q38PACK-v2 prototype SoA:
-        // [meta 20B/block][128B align][qh 32B/block][128B align][qs 128B/block]
-        const std::size_t meta_bytes = total_blocks * 20;
-        const std::size_t qh_offset = align_up(meta_bytes, 128);
-        const std::size_t qh_bytes = total_blocks * 32;
-        const std::size_t qs_offset = align_up(qh_offset + qh_bytes, 128);
-        const std::size_t qs_bytes = total_blocks * 128;
-        const std::size_t repacked_bytes = qs_offset + qs_bytes;
-
-        std::vector<std::byte> repacked(repacked_bytes);
-        std::array<std::byte, q38::kQ5KSm86BytesPerBlock> temp{};
-
-        const auto* source = pack.tensor_data(*tensor);
-        const auto repack_t0 = std::chrono::steady_clock::now();
-        for (std::size_t ib = 0; ib < total_blocks; ++ib) {
-            q38::repack_q5_k_sm86_block(
-                source + ib * q38::kQ5KBytesPerBlock, temp.data());
-            std::memcpy(repacked.data() + ib * 20, temp.data() + 0, 20);
-            std::memcpy(repacked.data() + qh_offset + ib * 32, temp.data() + 20, 32);
-            std::memcpy(repacked.data() + qs_offset + ib * 128, temp.data() + 52, 128);
-        }
-        const auto repack_t1 = std::chrono::steady_clock::now();
-        const double repack_ms =
-            std::chrono::duration<double, std::milli>(repack_t1 - repack_t0).count();
-
+        std::vector<std::byte> temporary_repack;
+        const std::byte* repacked_ptr = nullptr;
+        std::size_t qh_offset = 0;
+        std::size_t qs_offset = 0;
+        std::size_t repacked_bytes = 0;
+        double repack_ms = 0.0;
         double repack_decode_max_abs = 0.0;
-        {
+        bool persisted_v2 = tensor->layout == q38::TensorLayout::Sm86Q5KSoA;
+
+        if (persisted_v2) {
+            if (pack.header().version < 2) {
+                throw std::runtime_error("SM86 Q5_K layout requires Q38PACK v2");
+            }
+            repacked_ptr = pack.tensor_data(*tensor);
+            qh_offset = static_cast<std::size_t>(tensor->aux0_offset - tensor->data_offset);
+            qs_offset = static_cast<std::size_t>(tensor->aux1_offset - tensor->data_offset);
+            repacked_bytes = tensor->stored_bytes;
+        } else if (tensor->layout == q38::TensorLayout::GgufNative) {
+            if (tensor->stored_bytes < original_bytes) {
+                std::cerr << "q38-q5k-sm86-gemv: native tensor storage is smaller than expected Q5_K payload\n";
+                return 7;
+            }
+
+            const std::size_t meta_bytes = total_blocks * 20;
+            qh_offset = align_up(meta_bytes, 128);
+            const std::size_t qh_bytes = total_blocks * 32;
+            qs_offset = align_up(qh_offset + qh_bytes, 128);
+            const std::size_t qs_bytes = total_blocks * 128;
+            repacked_bytes = qs_offset + qs_bytes;
+
+            temporary_repack.resize(repacked_bytes);
+            std::array<std::byte, q38::kQ5KSm86BytesPerBlock> temp{};
+            const auto* source = pack.tensor_data(*tensor);
+
+            const auto repack_t0 = std::chrono::steady_clock::now();
+            for (std::size_t ib = 0; ib < total_blocks; ++ib) {
+                q38::repack_q5_k_sm86_block(
+                    source + ib * q38::kQ5KBytesPerBlock, temp.data());
+                std::memcpy(temporary_repack.data() + ib * 20, temp.data() + 0, 20);
+                std::memcpy(temporary_repack.data() + qh_offset + ib * 32, temp.data() + 20, 32);
+                std::memcpy(temporary_repack.data() + qs_offset + ib * 128, temp.data() + 52, 128);
+            }
+            const auto repack_t1 = std::chrono::steady_clock::now();
+            repack_ms =
+                std::chrono::duration<double, std::milli>(repack_t1 - repack_t0).count();
+
             std::array<float, q38::kQ4KValuesPerBlock> original{};
             std::array<float, q38::kQ4KValuesPerBlock> transformed{};
             std::array<std::byte, q38::kQ5KSm86BytesPerBlock> check_block{};
@@ -107,9 +121,9 @@ int main(int argc, char** argv) {
             for (std::size_t ib = 0; ib < checked_blocks; ++ib) {
                 q38::dequantize_q5_k_block_cpu(
                     source + ib * q38::kQ5KBytesPerBlock, original);
-                std::memcpy(check_block.data() + 0, repacked.data() + ib * 20, 20);
-                std::memcpy(check_block.data() + 20, repacked.data() + qh_offset + ib * 32, 32);
-                std::memcpy(check_block.data() + 52, repacked.data() + qs_offset + ib * 128, 128);
+                std::memcpy(check_block.data() + 0, temporary_repack.data() + ib * 20, 20);
+                std::memcpy(check_block.data() + 20, temporary_repack.data() + qh_offset + ib * 32, 32);
+                std::memcpy(check_block.data() + 52, temporary_repack.data() + qs_offset + ib * 128, 128);
                 q38::dequantize_q5_k_sm86_block_cpu(check_block.data(), transformed);
                 for (std::size_t j = 0; j < q38::kQ4KValuesPerBlock; ++j) {
                     repack_decode_max_abs = std::max(
@@ -122,9 +136,17 @@ int main(int argc, char** argv) {
                           << repack_decode_max_abs << "\n";
                 return 9;
             }
+
+            repacked_ptr = temporary_repack.data();
+        } else {
+            std::cerr << "q38-q5k-sm86-gemv: unsupported tensor layout "
+                      << static_cast<std::uint32_t>(tensor->layout) << "\n";
+            return 10;
         }
 
         std::cout << "Q38RT SM86-repacked Q5_K SoA GEMV\n";
+        std::cout << "q38pack_version: " << pack.header().version << "\n";
+        std::cout << "source_layout: " << (persisted_v2 ? "persisted_v2" : "temporary_from_native") << "\n";
         std::cout << "tensor: " << tensor->name << "\n";
         std::cout << "shape: [" << cols << "," << rows << "]\n";
         std::cout << "original_Q5K_bytes: " << original_bytes << "\n";
@@ -135,9 +157,13 @@ int main(int argc, char** argv) {
                       static_cast<double>(original_bytes))
                   << "\n";
         std::cout << "offline_repack_ms: " << repack_ms << "\n";
-        std::cout << std::scientific << std::setprecision(6);
-        std::cout << "repack_decode_max_abs_error: " << repack_decode_max_abs << "\n";
-        std::cout << std::fixed << std::setprecision(3);
+        if (!persisted_v2) {
+            std::cout << std::scientific << std::setprecision(6);
+            std::cout << "repack_decode_max_abs_error: " << repack_decode_max_abs << "\n";
+            std::cout << std::fixed << std::setprecision(3);
+        } else {
+            std::cout << "repack_decode_max_abs_error: persisted_at_conversion\n";
+        }
         std::cout << "layout: META20_SOA + QH32_SOA + QS128_SOA\n";
 
         q38::NvidiaDriver driver;
@@ -152,7 +178,7 @@ int main(int argc, char** argv) {
         double physical_gbps = 0.0;
 
         if (!driver.run_q5k_sm86_gemv_smoke(
-                repacked.data(),
+                repacked_ptr,
                 qh_offset,
                 qs_offset,
                 cols,
