@@ -78,6 +78,9 @@ target_link_libraries(q38-recurrent-prep PRIVATE q38rt)
 add_executable(q38-layer0-recurrent-front src/layer0_recurrent_front.cpp)
 target_link_libraries(q38-layer0-recurrent-front PRIVATE q38rt)
 
+add_executable(q38-layer0-recurrent-attention src/layer0_recurrent_attention.cpp)
+target_link_libraries(q38-layer0-recurrent-attention PRIVATE q38rt)
+
 if(Q38_BUILD_TESTS)
   enable_testing()
   add_executable(q38pack-smoke tests/q38pack_smoke.cpp)
