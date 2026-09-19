@@ -1178,6 +1178,54 @@ GRN_DONE:
 AR_DONE:
     ret;
 }
+
+.visible .entry q38_ffn_silu_mul_f32(
+    .param .u64 p_gate,
+    .param .u64 p_up,
+    .param .u64 p_out,
+    .param .u32 p_n,
+    .param .f32 p_log2e
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [p_gate];
+    ld.param.u64 %rd2, [p_up];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.u32 %r1, [p_n];
+    ld.param.f32 %f1, [p_log2e];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra FSM_DONE;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd6, %rd2, %rd4;
+    add.s64 %rd7, %rd3, %rd4;
+
+    ld.global.f32 %f2, [%rd5];
+    ld.global.f32 %f3, [%rd6];
+
+    neg.f32 %f4, %f2;
+    mul.rn.f32 %f4, %f4, %f1;
+    ex2.approx.f32 %f5, %f4;
+    add.rn.f32 %f5, %f5, 0f3F800000;
+    rcp.approx.f32 %f6, %f5;
+    mul.rn.f32 %f7, %f2, %f6;
+    mul.rn.f32 %f8, %f7, %f3;
+
+    st.global.f32 [%rd7], %f8;
+
+FSM_DONE:
+    ret;
+}
 )ptx";
 
 constexpr const char* kQ4KDequantPtx = R"ptx(
