@@ -1,4 +1,5 @@
 #include "q38/driver.hpp"
+#include "q38/quant.hpp"
 
 #include <algorithm>
 #include <array>
@@ -317,6 +318,126 @@ SUM_DONE:
     st.global.f32 [%rd8], %f9;
 
 APPLY_DONE:
+    ret;
+}
+)ptx";
+
+constexpr const char* kQ4KDequantPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_dequant_q4k_block(
+    .param .u64 p_block,
+    .param .u64 p_out
+)
+{
+    .reg .pred %p<8>;
+    .reg .b16 %h<4>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [p_block];
+    ld.param.u64 %rd2, [p_out];
+
+    mov.u32 %r1, %tid.x;
+    setp.ge.u32 %p1, %r1, 256;
+    @%p1 bra Q4K_DONE;
+
+    // d and dmin
+    ld.global.b16 %h1, [%rd1+0];
+    ld.global.b16 %h2, [%rd1+2];
+    cvt.f32.f16 %f1, %h1;
+    cvt.f32.f16 %f2, %h2;
+
+    // group = tid / 32, lane = tid % 32
+    shr.u32 %r2, %r1, 5;
+    and.b32 %r3, %r1, 31;
+
+    // scales base = block + 4
+    add.s64 %rd3, %rd1, 4;
+
+    setp.lt.u32 %p2, %r2, 4;
+    @%p2 bra SCALE_LOW;
+
+    // group 4..7:
+    // sc = (q[g+4] & 0x0f) | ((q[g-4] >> 6) << 4)
+    // m  = (q[g+4] >> 4)   | ((q[g]   >> 6) << 4)
+    add.u32 %r4, %r2, 4;
+    cvt.u64.u32 %rd4, %r4;
+    add.s64 %rd5, %rd3, %rd4;
+    ld.global.u8 %r5, [%rd5];
+
+    sub.u32 %r6, %r2, 4;
+    cvt.u64.u32 %rd6, %r6;
+    add.s64 %rd7, %rd3, %rd6;
+    ld.global.u8 %r7, [%rd7];
+
+    cvt.u64.u32 %rd8, %r2;
+    add.s64 %rd9, %rd3, %rd8;
+    ld.global.u8 %r8, [%rd9];
+
+    and.b32 %r9, %r5, 15;
+    shr.u32 %r10, %r7, 6;
+    shl.b32 %r10, %r10, 4;
+    or.b32 %r11, %r9, %r10;
+
+    shr.u32 %r12, %r5, 4;
+    shr.u32 %r13, %r8, 6;
+    shl.b32 %r13, %r13, 4;
+    or.b32 %r14, %r12, %r13;
+    bra SCALE_READY;
+
+SCALE_LOW:
+    // group 0..3:
+    // sc = q[g] & 63, m = q[g+4] & 63
+    cvt.u64.u32 %rd4, %r2;
+    add.s64 %rd5, %rd3, %rd4;
+    ld.global.u8 %r5, [%rd5];
+    and.b32 %r11, %r5, 63;
+
+    add.u32 %r6, %r2, 4;
+    cvt.u64.u32 %rd6, %r6;
+    add.s64 %rd7, %rd3, %rd6;
+    ld.global.u8 %r7, [%rd7];
+    and.b32 %r14, %r7, 63;
+
+SCALE_READY:
+    cvt.rn.f32.u32 %f3, %r11;
+    cvt.rn.f32.u32 %f4, %r14;
+    mul.rn.f32 %f5, %f1, %f3;
+    mul.rn.f32 %f6, %f2, %f4;
+
+    // qs base = block + 16
+    // byte index = (group/2)*32 + lane
+    shr.u32 %r15, %r2, 1;
+    shl.b32 %r15, %r15, 5;
+    add.u32 %r15, %r15, %r3;
+    cvt.u64.u32 %rd10, %r15;
+    add.s64 %rd11, %rd1, 16;
+    add.s64 %rd12, %rd11, %rd10;
+    ld.global.u8 %r16, [%rd12];
+
+    and.b32 %r17, %r2, 1;
+    setp.eq.u32 %p3, %r17, 0;
+    @%p3 bra LOW_NIBBLE;
+    shr.u32 %r18, %r16, 4;
+    bra NIBBLE_READY;
+
+LOW_NIBBLE:
+    and.b32 %r18, %r16, 15;
+
+NIBBLE_READY:
+    cvt.rn.f32.u32 %f7, %r18;
+    mul.rn.f32 %f8, %f5, %f7;
+    sub.rn.f32 %f9, %f8, %f6;
+
+    mul.wide.u32 %rd13, %r1, 4;
+    add.s64 %rd14, %rd2, %rd13;
+    st.global.f32 [%rd14], %f9;
+
+Q4K_DONE:
     ret;
 }
 )ptx";
@@ -652,6 +773,128 @@ bool NvidiaDriver::run_rmsnorm_smoke(std::string* error, double* max_abs_error, 
         if (!(abs_max <= 5.0e-4 && rel_max <= 5.0e-4)) {
             std::ostringstream oss;
             oss << "RMSNorm numeric mismatch: max_abs=" << abs_max << " max_rel=" << rel_max;
+            throw std::runtime_error(oss.str());
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool NvidiaDriver::run_q4k_dequant_smoke(const std::byte* block, std::string* error, double* max_abs_error, double* max_rel_error) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error("q38 Q4_K smoke requires compute capability 8.6; detected sm_" +
+                                     std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (!block) throw std::invalid_argument("Q4_K block is null");
+
+        std::array<float, kQ4KValuesPerBlock> reference{};
+        dequantize_q4_k_block_cpu(block, reference);
+        std::array<float, kQ4KValuesPerBlock> gpu{};
+
+        const std::size_t block_off = 0;
+        const std::size_t out_off = 256;
+        const std::size_t total_bytes = out_off + gpu.size() * sizeof(float);
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD = CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH = CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using ModuleLoadDataEx = CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction = CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel = CUresult(*)(CUfunction,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod = sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh = sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto module_load_ex = sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload = sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function = sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch = sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync = sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        const CUdeviceptr block_ptr = memory.ptr() + block_off;
+        const CUdeviceptr out_ptr = memory.ptr() + out_off;
+        check(handle_, memcpy_htod(block_ptr, block, kQ4KBytesPerBlock), "cuMemcpyHtoD(Q4_K block)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto module_rc = module_load_ex(
+            &module,
+            kQ4KDequantPtx,
+            static_cast<unsigned int>(sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (module_rc != CUDA_SUCCESS) {
+            std::string detail = cuda_error(handle_, module_rc, "cuModuleLoadDataEx(Q4_K)");
+            if (jit_error[0] != '\0') detail += std::string("\nPTX JIT error log:\n") + jit_error.data();
+            if (jit_info[0] != '\0') detail += std::string("\nPTX JIT info log:\n") + jit_info.data();
+            throw std::runtime_error(detail);
+        }
+
+        try {
+            CUfunction fn{};
+            check(handle_, module_get_function(&fn, module, "q38_dequant_q4k_block"),
+                  "cuModuleGetFunction(q38_dequant_q4k_block)");
+
+            CUdeviceptr arg_block = block_ptr;
+            CUdeviceptr arg_out = out_ptr;
+            void* params[] = {&arg_block, &arg_out};
+            check(handle_, launch(fn, 1, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr),
+                  "cuLaunchKernel(q38_dequant_q4k_block)");
+            check(handle_, sync(), "cuCtxSynchronize(Q4_K)");
+            check(handle_, memcpy_dtoh(gpu.data(), out_ptr, gpu.size() * sizeof(float)),
+                  "cuMemcpyDtoH(Q4_K)");
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+        check(handle_, module_unload(module), "cuModuleUnload(Q4_K)");
+
+        double abs_max = 0.0;
+        double rel_max = 0.0;
+        for (std::size_t i = 0; i < gpu.size(); ++i) {
+            const double got = static_cast<double>(gpu[i]);
+            const double ref = static_cast<double>(reference[i]);
+            const double abs_err = std::abs(got - ref);
+            const double rel_err = abs_err / std::max(1.0e-6, std::abs(ref));
+            abs_max = std::max(abs_max, abs_err);
+            rel_max = std::max(rel_max, rel_err);
+        }
+        if (max_abs_error) *max_abs_error = abs_max;
+        if (max_rel_error) *max_rel_error = rel_max;
+
+        if (!(abs_max <= 1.0e-5 && rel_max <= 1.0e-5)) {
+            std::ostringstream oss;
+            oss << "Q4_K dequant mismatch: max_abs=" << abs_max << " max_rel=" << rel_max;
             throw std::runtime_error(oss.str());
         }
         return true;
