@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 #include <dlfcn.h>
 #include <sstream>
 #include <stdexcept>
@@ -563,6 +564,180 @@ Q5_NIBBLE_READY:
     st.global.f32 [%rd17], %f9;
 
 Q5K_DONE:
+    ret;
+}
+)ptx";
+
+constexpr const char* kQ5KGemvPtx = R"ptx(
+.version 7.1
+.target sm_86
+.address_size 64
+
+.visible .entry q38_q5k_gemv_f32(
+    .param .u64 p_weights,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_cols,
+    .param .u32 p_rows
+)
+{
+    .reg .pred %p<12>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<16>;
+
+    ld.param.u64 %rd1, [p_weights];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_rows];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    setp.ge.u32 %p1, %r3, %r2;
+    @%p1 bra GEMV_DONE;
+    setp.ge.u32 %p2, %r4, 32;
+    @%p2 bra GEMV_DONE;
+
+    // 256 values per Q5_K block.
+    shr.u32 %r5, %r1, 8;
+    mov.u32 %r6, 0;       // block index
+    mov.f32 %f10, 0f00000000;
+
+    // bytes_per_row = nblocks * 176
+    mul.lo.u32 %r7, %r5, 176;
+    mul.wide.u32 %rd4, %r3, %r7;
+    add.s64 %rd5, %rd1, %rd4;
+
+BLOCK_LOOP:
+    setp.ge.u32 %p3, %r6, %r5;
+    @%p3 bra BLOCKS_DONE;
+
+    mul.wide.u32 %rd6, %r6, 176;
+    add.s64 %rd7, %rd5, %rd6;
+
+    // d / dmin
+    ld.global.b16 %r40, [%rd7+0];
+    ld.global.b16 %r41, [%rd7+2];
+    cvt.f32.f16 %f1, %r40;
+    cvt.f32.f16 %f2, %r41;
+
+    mov.u32 %r8, 0; // group 0..7
+
+GROUP_LOOP:
+    setp.ge.u32 %p4, %r8, 8;
+    @%p4 bra GROUPS_DONE;
+
+    // Decode 6-bit scale/min for this 32-value group.
+    add.s64 %rd8, %rd7, 4;
+    setp.lt.u32 %p5, %r8, 4;
+    @%p5 bra GEMV_SCALE_LOW;
+
+    add.u32 %r9, %r8, 4;
+    cvt.u64.u32 %rd9, %r9;
+    add.s64 %rd10, %rd8, %rd9;
+    ld.global.u8 %r10, [%rd10];
+
+    sub.u32 %r11, %r8, 4;
+    cvt.u64.u32 %rd11, %r11;
+    add.s64 %rd12, %rd8, %rd11;
+    ld.global.u8 %r12, [%rd12];
+
+    cvt.u64.u32 %rd13, %r8;
+    add.s64 %rd14, %rd8, %rd13;
+    ld.global.u8 %r13, [%rd14];
+
+    and.b32 %r14, %r10, 15;
+    shr.u32 %r15, %r12, 6;
+    shl.b32 %r15, %r15, 4;
+    or.b32 %r16, %r14, %r15;
+
+    shr.u32 %r17, %r10, 4;
+    shr.u32 %r18, %r13, 6;
+    shl.b32 %r18, %r18, 4;
+    or.b32 %r19, %r17, %r18;
+    bra GEMV_SCALE_READY;
+
+GEMV_SCALE_LOW:
+    cvt.u64.u32 %rd9, %r8;
+    add.s64 %rd10, %rd8, %rd9;
+    ld.global.u8 %r10, [%rd10];
+    and.b32 %r16, %r10, 63;
+
+    add.u32 %r11, %r8, 4;
+    cvt.u64.u32 %rd11, %r11;
+    add.s64 %rd12, %rd8, %rd11;
+    ld.global.u8 %r12, [%rd12];
+    and.b32 %r19, %r12, 63;
+
+GEMV_SCALE_READY:
+    cvt.rn.f32.u32 %f3, %r16;
+    cvt.rn.f32.u32 %f4, %r19;
+    mul.rn.f32 %f5, %f1, %f3;
+    mul.rn.f32 %f6, %f2, %f4;
+
+    // ql byte index = (group/2)*32 + lane, ql base = +48.
+    shr.u32 %r20, %r8, 1;
+    shl.b32 %r20, %r20, 5;
+    add.u32 %r20, %r20, %r4;
+    cvt.u64.u32 %rd15, %r20;
+    add.s64 %rd16, %rd7, 48;
+    add.s64 %rd17, %rd16, %rd15;
+    ld.global.u8 %r21, [%rd17];
+
+    and.b32 %r22, %r8, 1;
+    setp.eq.u32 %p6, %r22, 0;
+    @%p6 bra GEMV_LOW_NIBBLE;
+    shr.u32 %r23, %r21, 4;
+    bra GEMV_NIBBLE_READY;
+
+GEMV_LOW_NIBBLE:
+    and.b32 %r23, %r21, 15;
+
+GEMV_NIBBLE_READY:
+    // High bit: qh[lane] bit[group], qh base = +16.
+    cvt.u64.u32 %rd18, %r4;
+    add.s64 %rd19, %rd7, 16;
+    add.s64 %rd20, %rd19, %rd18;
+    ld.global.u8 %r24, [%rd20];
+    mov.u32 %r25, 1;
+    shl.b32 %r25, %r25, %r8;
+    and.b32 %r26, %r24, %r25;
+    setp.ne.u32 %p7, %r26, 0;
+    mov.u32 %r27, 0;
+    @%p7 mov.u32 %r27, 16;
+    add.u32 %r28, %r23, %r27;
+
+    cvt.rn.f32.u32 %f7, %r28;
+    mul.rn.f32 %f8, %f5, %f7;
+    sub.rn.f32 %f9, %f8, %f6;
+
+    // x index = block*256 + group*32 + lane
+    shl.b32 %r29, %r6, 8;
+    shl.b32 %r30, %r8, 5;
+    add.u32 %r31, %r29, %r30;
+    add.u32 %r31, %r31, %r4;
+    mul.wide.u32 %rd21, %r31, 4;
+    add.s64 %rd22, %rd2, %rd21;
+    ld.global.f32 %f11, [%rd22];
+
+    fma.rn.f32 %f10, %f9, %f11, %f10;
+
+    add.u32 %r8, %r8, 1;
+    bra GROUP_LOOP;
+
+GROUPS_DONE:
+    add.u32 %r6, %r6, 1;
+    bra BLOCK_LOOP;
+
+BLOCKS_DONE:
+    // Baseline reduction: 32 atomics to one output element per row.
+    // This is intentionally simple; warp-shuffle reduction is the next perf step.
+    mul.wide.u32 %rd23, %r3, 4;
+    add.s64 %rd23, %rd3, %rd23;
+    atom.global.add.f32 %f12, [%rd23], %f10;
+
+GEMV_DONE:
     ret;
 }
 )ptx";
@@ -1144,6 +1319,188 @@ bool NvidiaDriver::run_q5k_dequant_smoke(const std::byte* block, std::string* er
             oss << "Q5_K dequant mismatch: max_abs=" << abs_max << " max_rel=" << rel_max;
             throw std::runtime_error(oss.str());
         }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+bool NvidiaDriver::run_q5k_gemv_smoke(
+    const std::byte* matrix,
+    std::uint32_t cols,
+    std::uint32_t rows,
+    std::string* error,
+    double* max_abs_error,
+    double* max_rel_error,
+    double* milliseconds,
+    double* bandwidth_gbps) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error("q38 Q5_K GEMV requires sm_86; detected sm_" +
+                                     std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (!matrix) throw std::invalid_argument("Q5_K matrix is null");
+        if (cols == 0 || rows == 0 || (cols % kQ4KValuesPerBlock) != 0) {
+            throw std::invalid_argument("Q5_K GEMV requires non-zero rows and cols divisible by 256");
+        }
+
+        const std::size_t blocks_per_row = cols / kQ4KValuesPerBlock;
+        const std::size_t matrix_bytes =
+            static_cast<std::size_t>(rows) * blocks_per_row * kQ5KBytesPerBlock;
+        const std::size_t x_bytes = static_cast<std::size_t>(cols) * sizeof(float);
+        const std::size_t y_bytes = static_cast<std::size_t>(rows) * sizeof(float);
+
+        auto align256 = [](std::size_t v) { return (v + 255u) & ~std::size_t(255u); };
+        const std::size_t matrix_off = 0;
+        const std::size_t x_off = align256(matrix_bytes);
+        const std::size_t y_off = align256(x_off + x_bytes);
+        const std::size_t total_bytes = y_off + y_bytes;
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD = CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH = CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using MemsetD32 = CUresult(*)(CUdeviceptr, unsigned int, std::size_t);
+        using ModuleLoadDataEx = CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction = CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel = CUresult(*)(CUfunction,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod = sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh = sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto memset_d32 = sym<MemsetD32>(handle_, "cuMemsetD32_v2");
+        const auto module_load_ex = sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload = sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function = sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch = sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync = sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        std::vector<float> x(cols);
+        std::vector<float> y(rows);
+        for (std::uint32_t i = 0; i < cols; ++i) {
+            const float fi = static_cast<float>(i);
+            x[i] = std::sin(fi * 0.017f) * 0.65f + std::cos(fi * 0.011f) * 0.35f;
+        }
+
+        const CUdeviceptr matrix_ptr = memory.ptr() + matrix_off;
+        const CUdeviceptr x_ptr = memory.ptr() + x_off;
+        const CUdeviceptr y_ptr = memory.ptr() + y_off;
+        check(handle_, memcpy_htod(matrix_ptr, matrix, matrix_bytes), "cuMemcpyHtoD(Q5_K matrix)");
+        check(handle_, memcpy_htod(x_ptr, x.data(), x_bytes), "cuMemcpyHtoD(GEMV x)");
+        check(handle_, memset_d32(y_ptr, 0, rows), "cuMemsetD32(GEMV y)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+        std::array<char, 8192> jit_info{};
+        std::array<char, 8192> jit_error{};
+        int jit_options[] = {
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_LOG_VERBOSE,
+        };
+        void* jit_values[] = {
+            jit_info.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_info.size())),
+            jit_error.data(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(jit_error.size())),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(1)),
+        };
+
+        CUmodule module{};
+        const auto module_rc = module_load_ex(
+            &module,
+            kQ5KGemvPtx,
+            static_cast<unsigned int>(sizeof(jit_options) / sizeof(jit_options[0])),
+            jit_options,
+            jit_values);
+        if (module_rc != CUDA_SUCCESS) {
+            std::string detail = cuda_error(handle_, module_rc, "cuModuleLoadDataEx(Q5_K GEMV)");
+            if (jit_error[0] != '\0') detail += std::string("\nPTX JIT error log:\n") + jit_error.data();
+            if (jit_info[0] != '\0') detail += std::string("\nPTX JIT info log:\n") + jit_info.data();
+            throw std::runtime_error(detail);
+        }
+
+        CUfunction fn{};
+        try {
+            check(handle_, module_get_function(&fn, module, "q38_q5k_gemv_f32"),
+                  "cuModuleGetFunction(q38_q5k_gemv_f32)");
+
+            CUdeviceptr arg_w = matrix_ptr;
+            CUdeviceptr arg_x = x_ptr;
+            CUdeviceptr arg_y = y_ptr;
+            std::uint32_t arg_cols = cols;
+            std::uint32_t arg_rows = rows;
+            void* params[] = {&arg_w, &arg_x, &arg_y, &arg_cols, &arg_rows};
+
+            check(handle_, launch(fn, rows, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
+                  "cuLaunchKernel(q38_q5k_gemv_f32)");
+            check(handle_, sync(), "cuCtxSynchronize(Q5_K GEMV correctness)");
+            check(handle_, memcpy_dtoh(y.data(), y_ptr, y_bytes), "cuMemcpyDtoH(Q5_K GEMV)");
+
+            const std::size_t checked_rows = std::min<std::size_t>(rows, 8);
+            std::array<float, kQ4KValuesPerBlock> deq{};
+            double abs_max = 0.0;
+            double rel_max = 0.0;
+            for (std::size_t row = 0; row < checked_rows; ++row) {
+                double ref = 0.0;
+                const auto* row_ptr =
+                    matrix + row * blocks_per_row * kQ5KBytesPerBlock;
+                for (std::size_t ib = 0; ib < blocks_per_row; ++ib) {
+                    dequantize_q5_k_block_cpu(
+                        row_ptr + ib * kQ5KBytesPerBlock, deq);
+                    const std::size_t base = ib * kQ4KValuesPerBlock;
+                    for (std::size_t j = 0; j < kQ4KValuesPerBlock; ++j) {
+                        ref += static_cast<double>(deq[j]) *
+                               static_cast<double>(x[base + j]);
+                    }
+                }
+                const double got = static_cast<double>(y[row]);
+                const double abs_err = std::abs(got - ref);
+                const double rel_err = abs_err / std::max(1.0e-5, std::abs(ref));
+                abs_max = std::max(abs_max, abs_err);
+                rel_max = std::max(rel_max, rel_err);
+            }
+            if (max_abs_error) *max_abs_error = abs_max;
+            if (max_rel_error) *max_rel_error = rel_max;
+            if (!(abs_max <= 2.0e-3 && rel_max <= 2.0e-3)) {
+                std::ostringstream oss;
+                oss << "Q5_K GEMV mismatch: max_abs=" << abs_max
+                    << " max_rel=" << rel_max;
+                throw std::runtime_error(oss.str());
+            }
+
+            constexpr int kIters = 50;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kIters; ++i) {
+                check(handle_, launch(fn, rows, 1, 1, 32, 1, 1, 0, nullptr, params, nullptr),
+                      "cuLaunchKernel(q38_q5k_gemv_f32 benchmark)");
+            }
+            check(handle_, sync(), "cuCtxSynchronize(Q5_K GEMV benchmark)");
+            const auto t1 = std::chrono::steady_clock::now();
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(t1 - t0).count() /
+                static_cast<double>(kIters);
+            const double gbps =
+                static_cast<double>(matrix_bytes) / (elapsed_ms / 1000.0) / 1.0e9;
+            if (milliseconds) *milliseconds = elapsed_ms;
+            if (bandwidth_gbps) *bandwidth_gbps = gbps;
+        } catch (...) {
+            module_unload(module);
+            throw;
+        }
+
+        check(handle_, module_unload(module), "cuModuleUnload(Q5_K GEMV)");
         return true;
     } catch (const std::exception& e) {
         if (error) *error = e.what();
