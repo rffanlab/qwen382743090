@@ -11,6 +11,34 @@ static double gib(std::uint64_t bytes) {
     return static_cast<double>(bytes) / 1024.0 / 1024.0 / 1024.0;
 }
 
+static const char* ggml_type_name(std::uint32_t type) {
+    switch (type) {
+        case 0: return "F32";
+        case 1: return "F16";
+        case 2: return "Q4_0";
+        case 3: return "Q4_1";
+        case 6: return "Q5_0";
+        case 7: return "Q5_1";
+        case 8: return "Q8_0";
+        case 9: return "Q8_1";
+        case 10: return "Q2_K";
+        case 11: return "Q3_K";
+        case 12: return "Q4_K";
+        case 13: return "Q5_K";
+        case 14: return "Q6_K";
+        case 15: return "Q8_K";
+        case 16: return "IQ2_XXS";
+        case 17: return "IQ2_XS";
+        case 18: return "IQ3_XXS";
+        case 19: return "IQ1_S";
+        case 20: return "IQ4_NL";
+        case 21: return "IQ3_S";
+        case 22: return "IQ2_S";
+        case 23: return "IQ4_XS";
+        default: return "UNKNOWN";
+    }
+}
+
 static const char* role_name(q38::TensorRole role) {
     switch (role) {
         case q38::TensorRole::TokenEmbedding: return "embedding";
@@ -55,9 +83,19 @@ int main(int argc, char** argv) {
         const auto& stats = plan.stats();
 
         std::array<std::uint64_t, 9> by_role{};
-        for (const auto& t : plan.tensors()) {
+        std::array<std::uint64_t, 256> type_bytes{};
+        std::array<std::uint64_t, 256> type_count{};
+        const auto& source_tensors = pack.tensors();
+        for (std::size_t i = 0; i < plan.tensors().size(); ++i) {
+            const auto& t = plan.tensors()[i];
             const auto idx = static_cast<std::size_t>(t.role);
             if (idx < by_role.size()) by_role[idx] += t.payload_bytes;
+
+            const auto type = source_tensors[i].ggml_type;
+            if (type < type_bytes.size()) {
+                type_bytes[type] += t.payload_bytes;
+                type_count[type] += 1;
+            }
         }
 
         std::cout << "Q38 GPU placement plan\n";
@@ -72,6 +110,13 @@ int main(int argc, char** argv) {
             if (!by_role[i]) continue;
             std::cout << "role[" << role_name(static_cast<q38::TensorRole>(i)) << "]: "
                       << gib(by_role[i]) << " GiB\n";
+        }
+
+        std::cout << "tensor types:\n";
+        for (std::size_t i = 0; i < type_bytes.size(); ++i) {
+            if (!type_count[i]) continue;
+            std::cout << "  type[" << i << "/" << ggml_type_name(static_cast<std::uint32_t>(i)) << "]: "
+                      << type_count[i] << " tensors, " << gib(type_bytes[i]) << " GiB\n";
         }
 
         if (list) {
