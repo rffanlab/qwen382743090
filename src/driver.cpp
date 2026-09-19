@@ -5123,6 +5123,630 @@ bool NvidiaDriver::run_q5k_sm86_gemv_smoke(
     }
 }
 
+
+bool NvidiaDriver::run_qwen35_layer0_projection_pack(
+    const float* norm_weight,
+    const std::byte* qkv_matrix,
+    std::size_t qkv_qh_offset,
+    std::size_t qkv_qs_offset,
+    std::uint32_t qkv_rows,
+    const std::byte* gate_matrix,
+    std::size_t gate_qh_offset,
+    std::size_t gate_qs_offset,
+    std::uint32_t gate_rows,
+    const std::byte* beta_matrix,
+    const std::byte* alpha_matrix,
+    std::uint32_t cols,
+    std::uint32_t small_rows,
+    float rms_eps,
+    Layer0ProjectionPackStats* stats,
+    std::string* error) {
+    try {
+        if (!available()) throw std::runtime_error("driver is not initialized");
+        if (!is_sm86()) {
+            throw std::runtime_error(
+                "q38 layer0 projection pack requires sm_86; detected sm_" +
+                std::to_string(sm_major_) + std::to_string(sm_minor_));
+        }
+        if (!norm_weight || !qkv_matrix || !gate_matrix ||
+            !beta_matrix || !alpha_matrix) {
+            throw std::invalid_argument("layer0 projection pack received null tensor");
+        }
+        if (cols == 0 || qkv_rows == 0 || gate_rows == 0 ||
+            small_rows == 0 || (cols % kQ4KValuesPerBlock) != 0) {
+            throw std::invalid_argument("invalid layer0 projection pack dimensions");
+        }
+
+        const std::size_t q5_blocks_per_row =
+            cols / kQ4KValuesPerBlock;
+        const std::size_t qkv_blocks =
+            static_cast<std::size_t>(qkv_rows) * q5_blocks_per_row;
+        const std::size_t gate_blocks =
+            static_cast<std::size_t>(gate_rows) * q5_blocks_per_row;
+
+        const std::size_t qkv_meta_bytes = qkv_blocks * 20;
+        const std::size_t qkv_qh_bytes = qkv_blocks * 32;
+        const std::size_t qkv_qs_bytes = qkv_blocks * 128;
+        if (qkv_qh_offset < qkv_meta_bytes ||
+            qkv_qs_offset < qkv_qh_offset + qkv_qh_bytes) {
+            throw std::invalid_argument("invalid qkv SM86 Q5_K offsets");
+        }
+        const std::size_t qkv_bytes =
+            qkv_qs_offset + qkv_qs_bytes;
+
+        const std::size_t gate_meta_bytes = gate_blocks * 20;
+        const std::size_t gate_qh_bytes = gate_blocks * 32;
+        const std::size_t gate_qs_bytes = gate_blocks * 128;
+        if (gate_qh_offset < gate_meta_bytes ||
+            gate_qs_offset < gate_qh_offset + gate_qh_bytes) {
+            throw std::invalid_argument("invalid gate SM86 Q5_K offsets");
+        }
+        const std::size_t gate_bytes =
+            gate_qs_offset + gate_qs_bytes;
+
+        const std::size_t q4_blocks_per_row =
+            cols / kQ4KValuesPerBlock;
+        const std::size_t small_matrix_bytes =
+            static_cast<std::size_t>(small_rows) *
+            q4_blocks_per_row * kQ4KBytesPerBlock;
+
+        const std::size_t vec_bytes =
+            static_cast<std::size_t>(cols) * sizeof(float);
+        const std::size_t qkv_out_bytes =
+            static_cast<std::size_t>(qkv_rows) * sizeof(float);
+        const std::size_t gate_out_bytes =
+            static_cast<std::size_t>(gate_rows) * sizeof(float);
+        const std::size_t small_out_bytes =
+            static_cast<std::size_t>(small_rows) * sizeof(float);
+
+        auto align256 = [](std::size_t v) {
+            return (v + 255u) & ~std::size_t(255u);
+        };
+
+        const std::size_t qkv_off = 0;
+        const std::size_t gate_off = align256(qkv_off + qkv_bytes);
+        const std::size_t beta_off = align256(gate_off + gate_bytes);
+        const std::size_t alpha_off = align256(beta_off + small_matrix_bytes);
+        const std::size_t x_off = align256(alpha_off + small_matrix_bytes);
+        const std::size_t norm_w_off = align256(x_off + vec_bytes);
+        const std::size_t normed_off = align256(norm_w_off + vec_bytes);
+        const std::size_t sumsq_off = align256(normed_off + vec_bytes);
+        const std::size_t qkv_out_off = align256(sumsq_off + sizeof(float));
+        const std::size_t gate_out_off = align256(qkv_out_off + qkv_out_bytes);
+        const std::size_t beta_out_off = align256(gate_out_off + gate_out_bytes);
+        const std::size_t alpha_out_off = align256(beta_out_off + small_out_bytes);
+        const std::size_t total_bytes =
+            alpha_out_off + small_out_bytes;
+
+        ScopedVmm memory(handle_, device_ordinal_, total_bytes);
+
+        using MemcpyHtoD = CUresult(*)(CUdeviceptr, const void*, std::size_t);
+        using MemcpyDtoH = CUresult(*)(void*, CUdeviceptr, std::size_t);
+        using MemsetD32 = CUresult(*)(CUdeviceptr, unsigned int, std::size_t);
+        using ModuleLoadDataEx = CUresult(*)(CUmodule*, const void*, unsigned int, int*, void**);
+        using ModuleUnload = CUresult(*)(CUmodule);
+        using ModuleGetFunction = CUresult(*)(CUfunction*, CUmodule, const char*);
+        using LaunchKernel = CUresult(*)(CUfunction,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, unsigned int, unsigned int,
+                                         unsigned int, CUstream, void**, void**);
+        using CtxSynchronize = CUresult(*)();
+
+        const auto memcpy_htod = sym<MemcpyHtoD>(handle_, "cuMemcpyHtoD_v2");
+        const auto memcpy_dtoh = sym<MemcpyDtoH>(handle_, "cuMemcpyDtoH_v2");
+        const auto memset_d32 = sym<MemsetD32>(handle_, "cuMemsetD32_v2");
+        const auto module_load_ex = sym<ModuleLoadDataEx>(handle_, "cuModuleLoadDataEx");
+        const auto module_unload = sym<ModuleUnload>(handle_, "cuModuleUnload");
+        const auto module_get_function = sym<ModuleGetFunction>(handle_, "cuModuleGetFunction");
+        const auto launch = sym<LaunchKernel>(handle_, "cuLaunchKernel");
+        const auto sync = sym<CtxSynchronize>(handle_, "cuCtxSynchronize");
+
+        std::vector<float> x(cols), normed_cpu(cols);
+        for (std::uint32_t i = 0; i < cols; ++i) {
+            const float fi = static_cast<float>(i);
+            x[i] =
+                std::sin(fi * 0.017f) * 0.65f +
+                std::cos(fi * 0.011f) * 0.35f;
+        }
+
+        double sumsq_cpu = 0.0;
+        for (float v : x) {
+            sumsq_cpu += static_cast<double>(v) * static_cast<double>(v);
+        }
+        const double inv_rms =
+            1.0 / std::sqrt(
+                sumsq_cpu / static_cast<double>(cols) +
+                static_cast<double>(rms_eps));
+        for (std::uint32_t i = 0; i < cols; ++i) {
+            normed_cpu[i] = static_cast<float>(
+                static_cast<double>(x[i]) * inv_rms *
+                static_cast<double>(norm_weight[i]));
+        }
+
+        const CUdeviceptr base = memory.ptr();
+        const CUdeviceptr qkv_ptr = base + qkv_off;
+        const CUdeviceptr gate_ptr = base + gate_off;
+        const CUdeviceptr beta_ptr = base + beta_off;
+        const CUdeviceptr alpha_ptr = base + alpha_off;
+        const CUdeviceptr x_ptr = base + x_off;
+        const CUdeviceptr norm_w_ptr = base + norm_w_off;
+        const CUdeviceptr normed_ptr = base + normed_off;
+        const CUdeviceptr sumsq_ptr = base + sumsq_off;
+        const CUdeviceptr qkv_out_ptr = base + qkv_out_off;
+        const CUdeviceptr gate_out_ptr = base + gate_out_off;
+        const CUdeviceptr beta_out_ptr = base + beta_out_off;
+        const CUdeviceptr alpha_out_ptr = base + alpha_out_off;
+
+        check(handle_, memcpy_htod(qkv_ptr, qkv_matrix, qkv_bytes),
+              "cuMemcpyHtoD(layer0 qkv)");
+        check(handle_, memcpy_htod(gate_ptr, gate_matrix, gate_bytes),
+              "cuMemcpyHtoD(layer0 gate)");
+        check(handle_, memcpy_htod(beta_ptr, beta_matrix, small_matrix_bytes),
+              "cuMemcpyHtoD(layer0 beta)");
+        check(handle_, memcpy_htod(alpha_ptr, alpha_matrix, small_matrix_bytes),
+              "cuMemcpyHtoD(layer0 alpha)");
+        check(handle_, memcpy_htod(x_ptr, x.data(), vec_bytes),
+              "cuMemcpyHtoD(layer0 projection input)");
+        check(handle_, memcpy_htod(norm_w_ptr, norm_weight, vec_bytes),
+              "cuMemcpyHtoD(layer0 attn_norm)");
+
+        constexpr int CU_JIT_INFO_LOG_BUFFER = 3;
+        constexpr int CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER = 5;
+        constexpr int CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+        constexpr int CU_JIT_LOG_VERBOSE = 12;
+
+        auto load_module = [&](const char* ptx, const char* label) {
+            std::array<char, 8192> jit_info{};
+            std::array<char, 8192> jit_error{};
+            int jit_options[] = {
+                CU_JIT_INFO_LOG_BUFFER,
+                CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+                CU_JIT_ERROR_LOG_BUFFER,
+                CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                CU_JIT_LOG_VERBOSE,
+            };
+            void* jit_values[] = {
+                jit_info.data(),
+                reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(jit_info.size())),
+                jit_error.data(),
+                reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(jit_error.size())),
+                reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(1)),
+            };
+
+            CUmodule module{};
+            const auto rc = module_load_ex(
+                &module,
+                ptx,
+                static_cast<unsigned int>(
+                    sizeof(jit_options) / sizeof(jit_options[0])),
+                jit_options,
+                jit_values);
+
+            if (rc != CUDA_SUCCESS) {
+                std::string detail = cuda_error(handle_, rc, label);
+                if (jit_error[0] != '\0') {
+                    detail +=
+                        std::string("\nPTX JIT error log:\n") +
+                        jit_error.data();
+                }
+                if (jit_info[0] != '\0') {
+                    detail +=
+                        std::string("\nPTX JIT info log:\n") +
+                        jit_info.data();
+                }
+                throw std::runtime_error(detail);
+            }
+            return module;
+        };
+
+        CUmodule norm_module =
+            load_module(kRmsNormPtx, "cuModuleLoadDataEx(layer0 pack RMSNorm)");
+        CUmodule q5_module{};
+        CUmodule q4_module{};
+
+        try {
+            q5_module = load_module(
+                kQ5KSm86SoAGemvVecPtx,
+                "cuModuleLoadDataEx(layer0 pack Q5)");
+            q4_module = load_module(
+                kQ4KGemvPtx,
+                "cuModuleLoadDataEx(layer0 pack Q4)");
+
+            CUfunction sum_fn{}, norm_fn{}, q5_fn{}, q4_fn{};
+            check(handle_, module_get_function(
+                &sum_fn, norm_module, "q38_sumsq"),
+                "cuModuleGetFunction(layer0 pack sumsq)");
+            check(handle_, module_get_function(
+                &norm_fn, norm_module, "q38_rmsnorm_apply"),
+                "cuModuleGetFunction(layer0 pack rmsnorm)");
+            check(handle_, module_get_function(
+                &q5_fn, q5_module, "q38_q5k_sm86_soa_gemv_vec"),
+                "cuModuleGetFunction(layer0 pack q5)");
+            check(handle_, module_get_function(
+                &q4_fn, q4_module, "q38_q4k_gemv_f32"),
+                "cuModuleGetFunction(layer0 pack q4)");
+
+            constexpr unsigned int norm_block = 256;
+            const unsigned int norm_grid =
+                (cols + norm_block - 1) / norm_block;
+
+            CUdeviceptr sum_x = x_ptr;
+            CUdeviceptr sum_out = sumsq_ptr;
+            std::uint32_t count = cols;
+            void* sum_params[] = {
+                &sum_x, &sum_out, &count
+            };
+
+            CUdeviceptr norm_x = x_ptr;
+            CUdeviceptr norm_w = norm_w_ptr;
+            CUdeviceptr norm_y = normed_ptr;
+            CUdeviceptr norm_sumsq = sumsq_ptr;
+            float kernel_eps = rms_eps;
+            void* norm_params[] = {
+                &norm_x, &norm_w, &norm_y,
+                &norm_sumsq, &count, &kernel_eps
+            };
+
+            auto make_q5_args = [&](CUdeviceptr tensor_ptr,
+                                     std::size_t qh_offset,
+                                     std::size_t qs_offset,
+                                     CUdeviceptr out_ptr,
+                                     std::uint32_t rows) {
+                struct Args {
+                    CUdeviceptr meta;
+                    CUdeviceptr qh;
+                    CUdeviceptr qs;
+                    CUdeviceptr x;
+                    CUdeviceptr y;
+                    std::uint32_t cols;
+                    std::uint32_t rows;
+                    void* params[7];
+                };
+                Args a{};
+                a.meta = tensor_ptr;
+                a.qh = tensor_ptr + qh_offset;
+                a.qs = tensor_ptr + qs_offset;
+                a.x = normed_ptr;
+                a.y = out_ptr;
+                a.cols = cols;
+                a.rows = rows;
+                a.params[0] = &a.meta;
+                a.params[1] = &a.qh;
+                a.params[2] = &a.qs;
+                a.params[3] = &a.x;
+                a.params[4] = &a.y;
+                a.params[5] = &a.cols;
+                a.params[6] = &a.rows;
+                return a;
+            };
+
+            // Do not use make_q5_args() across statements: params contain
+            // pointers to the object's own members, so instantiate in-place.
+            CUdeviceptr qkv_meta = qkv_ptr;
+            CUdeviceptr qkv_qh = qkv_ptr + qkv_qh_offset;
+            CUdeviceptr qkv_qs = qkv_ptr + qkv_qs_offset;
+            CUdeviceptr qkv_x = normed_ptr;
+            CUdeviceptr qkv_y = qkv_out_ptr;
+            std::uint32_t qkv_cols_arg = cols;
+            std::uint32_t qkv_rows_arg = qkv_rows;
+            void* qkv_params[] = {
+                &qkv_meta, &qkv_qh, &qkv_qs, &qkv_x, &qkv_y,
+                &qkv_cols_arg, &qkv_rows_arg
+            };
+
+            CUdeviceptr gate_meta = gate_ptr;
+            CUdeviceptr gate_qh = gate_ptr + gate_qh_offset;
+            CUdeviceptr gate_qs = gate_ptr + gate_qs_offset;
+            CUdeviceptr gate_x = normed_ptr;
+            CUdeviceptr gate_y = gate_out_ptr;
+            std::uint32_t gate_cols_arg = cols;
+            std::uint32_t gate_rows_arg = gate_rows;
+            void* gate_params[] = {
+                &gate_meta, &gate_qh, &gate_qs, &gate_x, &gate_y,
+                &gate_cols_arg, &gate_rows_arg
+            };
+
+            CUdeviceptr beta_w = beta_ptr;
+            CUdeviceptr beta_x = normed_ptr;
+            CUdeviceptr beta_y = beta_out_ptr;
+            std::uint32_t beta_cols = cols;
+            std::uint32_t beta_rows = small_rows;
+            void* beta_params[] = {
+                &beta_w, &beta_x, &beta_y,
+                &beta_cols, &beta_rows
+            };
+
+            CUdeviceptr alpha_w = alpha_ptr;
+            CUdeviceptr alpha_x = normed_ptr;
+            CUdeviceptr alpha_y = alpha_out_ptr;
+            std::uint32_t alpha_cols = cols;
+            std::uint32_t alpha_rows = small_rows;
+            void* alpha_params[] = {
+                &alpha_w, &alpha_x, &alpha_y,
+                &alpha_cols, &alpha_rows
+            };
+
+            const unsigned int qkv_grid =
+                (qkv_rows + 3u) / 4u;
+            const unsigned int gate_grid =
+                (gate_rows + 3u) / 4u;
+
+            auto launch_norm = [&]() {
+                check(handle_, memset_d32(sumsq_ptr, 0, 1),
+                      "cuMemsetD32(layer0 pack sumsq)");
+                check(handle_, launch(
+                    sum_fn, norm_grid, 1, 1,
+                    norm_block, 1, 1,
+                    0, nullptr, sum_params, nullptr),
+                    "cuLaunchKernel(layer0 pack sumsq)");
+                check(handle_, launch(
+                    norm_fn, norm_grid, 1, 1,
+                    norm_block, 1, 1,
+                    0, nullptr, norm_params, nullptr),
+                    "cuLaunchKernel(layer0 pack rmsnorm)");
+            };
+
+            auto launch_qkv = [&]() {
+                check(handle_, launch(
+                    q5_fn, qkv_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, qkv_params, nullptr),
+                    "cuLaunchKernel(layer0 pack qkv)");
+            };
+
+            auto launch_gate = [&]() {
+                check(handle_, launch(
+                    q5_fn, gate_grid, 1, 1,
+                    128, 1, 1,
+                    0, nullptr, gate_params, nullptr),
+                    "cuLaunchKernel(layer0 pack gate)");
+            };
+
+            auto launch_beta = [&]() {
+                check(handle_, launch(
+                    q4_fn, small_rows, 1, 1,
+                    32, 1, 1,
+                    0, nullptr, beta_params, nullptr),
+                    "cuLaunchKernel(layer0 pack beta)");
+            };
+
+            auto launch_alpha = [&]() {
+                check(handle_, launch(
+                    q4_fn, small_rows, 1, 1,
+                    32, 1, 1,
+                    0, nullptr, alpha_params, nullptr),
+                    "cuLaunchKernel(layer0 pack alpha)");
+            };
+
+            launch_norm();
+            launch_qkv();
+            launch_gate();
+            launch_beta();
+            launch_alpha();
+            check(handle_, sync(),
+                  "cuCtxSynchronize(layer0 projection pack correctness)");
+
+            std::vector<float> qkv_out(qkv_rows);
+            std::vector<float> gate_out(gate_rows);
+            std::vector<float> beta_out(small_rows);
+            std::vector<float> alpha_out(small_rows);
+
+            check(handle_, memcpy_dtoh(
+                qkv_out.data(), qkv_out_ptr, qkv_out_bytes),
+                "cuMemcpyDtoH(layer0 qkv)");
+            check(handle_, memcpy_dtoh(
+                gate_out.data(), gate_out_ptr, gate_out_bytes),
+                "cuMemcpyDtoH(layer0 gate pack)");
+            check(handle_, memcpy_dtoh(
+                beta_out.data(), beta_out_ptr, small_out_bytes),
+                "cuMemcpyDtoH(layer0 beta)");
+            check(handle_, memcpy_dtoh(
+                alpha_out.data(), alpha_out_ptr, small_out_bytes),
+                "cuMemcpyDtoH(layer0 alpha)");
+
+            auto validate_q5 = [&](const std::byte* matrix,
+                                   std::size_t qh_offset,
+                                   std::size_t qs_offset,
+                                   std::uint32_t rows,
+                                   const std::vector<float>& got,
+                                   ProjectionErrorStats& out_stats) {
+                const std::size_t checked =
+                    std::min<std::size_t>(rows, 4);
+                std::array<float, kQ4KValuesPerBlock> deq{};
+                std::array<std::byte, kQ5KSm86BytesPerBlock> block{};
+                double abs_max = 0.0;
+                double rel_max = 0.0;
+                bool bad = false;
+
+                for (std::size_t row = 0; row < checked; ++row) {
+                    double ref = 0.0;
+                    for (std::size_t ib = 0;
+                         ib < q5_blocks_per_row; ++ib) {
+                        const std::size_t block_index =
+                            row * q5_blocks_per_row + ib;
+                        std::memcpy(
+                            block.data() + 0,
+                            matrix + block_index * 20,
+                            20);
+                        std::memcpy(
+                            block.data() + 20,
+                            matrix + qh_offset + block_index * 32,
+                            32);
+                        std::memcpy(
+                            block.data() + 52,
+                            matrix + qs_offset + block_index * 128,
+                            128);
+                        dequantize_q5_k_sm86_block_cpu(
+                            block.data(), deq);
+                        const std::size_t base_x =
+                            ib * kQ4KValuesPerBlock;
+                        for (std::size_t j = 0;
+                             j < kQ4KValuesPerBlock; ++j) {
+                            ref +=
+                                static_cast<double>(deq[j]) *
+                                static_cast<double>(
+                                    normed_cpu[base_x + j]);
+                        }
+                    }
+                    const double value =
+                        static_cast<double>(got[row]);
+                    const double abs_err =
+                        std::abs(value - ref);
+                    const double rel_err =
+                        abs_err /
+                        std::max(1.0e-5, std::abs(ref));
+                    abs_max = std::max(abs_max, abs_err);
+                    rel_max = std::max(rel_max, rel_err);
+                    if (abs_err > 3.0e-3 &&
+                        rel_err > 3.0e-3) {
+                        bad = true;
+                    }
+                }
+
+                out_stats.max_abs = abs_max;
+                out_stats.max_rel = rel_max;
+                if (bad) {
+                    std::ostringstream oss;
+                    oss << "layer0 Q5 projection mismatch: max_abs="
+                        << abs_max << " max_rel=" << rel_max;
+                    throw std::runtime_error(oss.str());
+                }
+            };
+
+            auto validate_q4 = [&](const std::byte* matrix,
+                                   const std::vector<float>& got,
+                                   ProjectionErrorStats& out_stats) {
+                const std::size_t checked =
+                    std::min<std::size_t>(small_rows, 4);
+                std::array<float, kQ4KValuesPerBlock> deq{};
+                double abs_max = 0.0;
+                double rel_max = 0.0;
+                bool bad = false;
+
+                for (std::size_t row = 0; row < checked; ++row) {
+                    double ref = 0.0;
+                    const auto* row_ptr =
+                        matrix +
+                        row * q4_blocks_per_row *
+                            kQ4KBytesPerBlock;
+
+                    for (std::size_t ib = 0;
+                         ib < q4_blocks_per_row; ++ib) {
+                        dequantize_q4_k_block_cpu(
+                            row_ptr +
+                                ib * kQ4KBytesPerBlock,
+                            deq);
+                        const std::size_t base_x =
+                            ib * kQ4KValuesPerBlock;
+                        for (std::size_t j = 0;
+                             j < kQ4KValuesPerBlock; ++j) {
+                            ref +=
+                                static_cast<double>(deq[j]) *
+                                static_cast<double>(
+                                    normed_cpu[base_x + j]);
+                        }
+                    }
+
+                    const double value =
+                        static_cast<double>(got[row]);
+                    const double abs_err =
+                        std::abs(value - ref);
+                    const double rel_err =
+                        abs_err /
+                        std::max(1.0e-5, std::abs(ref));
+
+                    abs_max = std::max(abs_max, abs_err);
+                    rel_max = std::max(rel_max, rel_err);
+                    if (abs_err > 2.0e-3 &&
+                        rel_err > 2.0e-3) {
+                        bad = true;
+                    }
+                }
+
+                out_stats.max_abs = abs_max;
+                out_stats.max_rel = rel_max;
+                if (bad) {
+                    std::ostringstream oss;
+                    oss << "layer0 Q4 projection mismatch: max_abs="
+                        << abs_max << " max_rel=" << rel_max;
+                    throw std::runtime_error(oss.str());
+                }
+            };
+
+            Layer0ProjectionPackStats local_stats{};
+            validate_q5(
+                qkv_matrix, qkv_qh_offset, qkv_qs_offset,
+                qkv_rows, qkv_out, local_stats.qkv);
+            validate_q5(
+                gate_matrix, gate_qh_offset, gate_qs_offset,
+                gate_rows, gate_out, local_stats.gate);
+            validate_q4(
+                beta_matrix, beta_out, local_stats.beta);
+            validate_q4(
+                alpha_matrix, alpha_out, local_stats.alpha);
+
+            auto bench = [&](int iters, auto&& fn, const char* label) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < iters; ++i) fn();
+                check(handle_, sync(), label);
+                const auto t1 = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::milli>(
+                    t1 - t0).count() /
+                    static_cast<double>(iters);
+            };
+
+            local_stats.rmsnorm_ms =
+                bench(100, launch_norm,
+                      "cuCtxSynchronize(layer0 pack RMSNorm benchmark)");
+            local_stats.qkv_ms =
+                bench(50, launch_qkv,
+                      "cuCtxSynchronize(layer0 pack qkv benchmark)");
+            local_stats.gate_ms =
+                bench(50, launch_gate,
+                      "cuCtxSynchronize(layer0 pack gate benchmark)");
+            local_stats.beta_ms =
+                bench(1000, launch_beta,
+                      "cuCtxSynchronize(layer0 pack beta benchmark)");
+            local_stats.alpha_ms =
+                bench(1000, launch_alpha,
+                      "cuCtxSynchronize(layer0 pack alpha benchmark)");
+
+            auto launch_chain = [&]() {
+                launch_norm();
+                launch_qkv();
+                launch_gate();
+                launch_beta();
+                launch_alpha();
+            };
+            local_stats.chain_ms =
+                bench(50, launch_chain,
+                      "cuCtxSynchronize(layer0 projection pack benchmark)");
+
+            if (stats) *stats = local_stats;
+        } catch (...) {
+            if (q4_module) module_unload(q4_module);
+            if (q5_module) module_unload(q5_module);
+            module_unload(norm_module);
+            throw;
+        }
+
+        check(handle_, module_unload(q4_module),
+              "cuModuleUnload(layer0 pack Q4)");
+        check(handle_, module_unload(q5_module),
+              "cuModuleUnload(layer0 pack Q5)");
+        check(handle_, module_unload(norm_module),
+              "cuModuleUnload(layer0 pack RMSNorm)");
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
 bool NvidiaDriver::run_qwen35_layer0_gate_smoke(
     const float* norm_weight,
     const std::byte* repacked_matrix,
