@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
         const auto cols = static_cast<std::uint32_t>(tensor->dims[0]);
         const auto rows = static_cast<std::uint32_t>(tensor->dims[1]);
 
-        std::cout << "Q38RT Q5_K x Q8_K integer GEMV\n";
+        std::cout << "Q38RT Q5_K x Q8_K DP4A GEMV\n";
         std::cout << "tensor: " << tensor->name << "\n";
         std::cout << "shape: [" << cols << "," << rows << "]\n";
         std::cout << "stored bytes: " << tensor->stored_bytes << "\n";
@@ -84,6 +84,8 @@ int main(int argc, char** argv) {
         std::cout << "kernel_ms: " << ms << "\n";
         std::cout << "effective_weight_bandwidth_GBps: " << gbps << "\n";
         std::cout << "activation_quantization_in_timing: no\n";
+        std::cout << "kernel_mapping: 1warp_4rows_8lane_subgroups\n";
+        std::cout << "dot_instruction: dp4a.u32.s32\n";
         std::cout << "q5_k_x_q8_k: PASS\n";
         return 0;
     } catch (const std::exception& e) {
