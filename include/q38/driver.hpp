@@ -33,6 +33,7 @@ public:
     bool run_q4k_dequant_smoke(const std::byte* block, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr);
     bool run_q5k_dequant_smoke(const std::byte* block, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr);
     bool run_q5k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
+    bool run_q5k_q8k_gemv_smoke(const std::byte* matrix, std::uint32_t cols, std::uint32_t rows, std::string* error = nullptr, double* max_abs_error = nullptr, double* max_rel_error = nullptr, double* milliseconds = nullptr, double* bandwidth_gbps = nullptr);
 
 private:
     void* handle_{nullptr};
