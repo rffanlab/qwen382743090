@@ -487,3 +487,53 @@ Decision rule:
 
     close to or above ~250 GB/s -> keep native IQ4_XS layout
     clearly below ~250 GB/s    -> prototype SM86_IQ4_XS_SOA and persist it in Q38PACK v2 only if benchmarked beneficial
+
+
+### SM86 IQ4_XS compact repack prototype
+
+The native IQ4_XS GEMV is numerically correct but the real RTX 3090 result on
+`blk.0.ffn_gate.weight [5120,17408]` is only:
+
+    kernel_ms: 0.2373
+    effective_weight_bandwidth_GBps: 199.5504
+
+That is too slow for a 47.35 MB FFN projection, so the current experiment keeps
+the 4-bit nonlinear weights compact and only moves decode metadata out of the hot loop:
+
+    source IQ4_XS block:
+      fp16 d                       2 bytes
+      packed scale metadata       6 bytes
+      qs                         128 bytes
+                                 ---
+                                 136 bytes
+
+    SM86 logical block:
+      fp16 d                       2 bytes
+      int8 group_scale[8]          8 bytes
+      qs                         128 bytes
+                                 ---
+                                 138 bytes
+
+GPU storage uses three SoA planes:
+
+    D plane:      2 bytes/block
+    SCALE plane:  8 bytes/block
+    QS plane:   128 bytes/block
+
+The weight nibbles and nonlinear 16-value codebook semantics are unchanged.
+The logical size increase is only about 1.47% before tiny 128-byte plane
+alignment padding.
+
+This is still a temporary benchmark-time repack; Q38PACK v2 is not changed yet.
+
+Run native and SM86 versions back-to-back:
+
+    ./build/q38-iq4xs-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack && ./build/q38-iq4xs-sm86-gemv --model ~/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P.sm86.q38pack
+
+The SM86 benchmark first requires exact decoded-weight equality, then reports:
+
+    original_equiv_weight_bandwidth_GBps
+    physical_repacked_bandwidth_GBps
+
+Only a meaningful win over the 199.5504 GB/s native baseline will justify
+adding a persistent SM86_IQ4_XS_SOA layout to Q38PACK v2.
